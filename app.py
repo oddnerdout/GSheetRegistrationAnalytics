@@ -109,32 +109,16 @@ def parse_transport_state(row, col_drive, col_ride, col_space):
 
 
 def infer_timing(status_val):
-    """
-    Explicit timing inference:
-    - Part-time sat. Night -> To Camp: Saturday | To NYC: Sunday (Lord's Day)
-    - Part-time fri. Night -> To Camp: Friday   | To NYC: Saturday
-    - Day-only / offsite   -> To Camp: Saturday | To NYC: Saturday
-    - Full time            -> To Camp: Friday   | To NYC: Sunday (Lord's Day)
-    """
     status = status_val.lower().strip()
     
-    # 1. Part-time (Sat. Night) -> Saturday arrival, Sunday return
     if "sat" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
         return "Saturday", "Sunday (Lord's Day)"
-        
-    # 2. Part-time (Fri. Night) -> Friday arrival, Saturday return
     elif "fri" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
         return "Friday", "Saturday"
-        
-    # 3. Day-only / Offsite -> Saturday arrival, Saturday return
     elif "day-only" in status or "day only" in status or "offsite" in status or "1 day" in status or "(1 day)" in status:
         return "Saturday", "Saturday"
-        
-    # 4. Full time / All weekend -> Friday arrival, Sunday return
     elif "full time" in status or "full-time" in status or "all weekend" in status or "full" in status:
         return "Friday", "Sunday (Lord's Day)"
-        
-    # 5. Fallbacks for specific day mentions
     elif "friday" in status or "fri" in status:
         return "Friday", "Friday (Day Only)"
     elif "sunday" in status or "lord's day" in status or "lords day" in status:
@@ -291,11 +275,16 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Row 3: Settings and Refresh -->
+        <!-- Row 3: Settings, Copy Link, and Refresh -->
         <div class="row g-2 mb-2">
-            <div class="col-10">
+            <div class="col-7">
                 <button class="btn btn-secondary btn-sm w-100 fw-bold" style="background-color: #5856d6; border-color: #5856d6;" data-bs-toggle="modal" data-bs-target="#settingsModal">
-                    ⚙️ Grouping & Sort Settings
+                    ⚙️ Settings
+                </button>
+            </div>
+            <div class="col-3">
+                <button class="btn btn-outline-primary btn-sm w-100 fw-bold" onclick="copyShareableLink()" title="Copy Link with Current Filters">
+                    🔗 Share
                 </button>
             </div>
             <div class="col-2">
@@ -314,6 +303,7 @@ HTML_TEMPLATE = """
 
 <div class="container py-2">
     <div id="statusAlert" class="alert alert-warning d-none" role="alert"></div>
+    <div id="toastContainer" class="position-fixed bottom-0 end-0 p-3" style="z-index: 1100"></div>
     <div id="contentList"></div>
 </div>
 
@@ -403,6 +393,7 @@ let primaryGroupCol = "";
 let secondaryGroupCol = "";
 let sortCol = "";
 let sortAscending = true;
+let isInitializedFromHash = false;
 
 async function refreshData() {
     let alertBox = document.getElementById('statusAlert');
@@ -433,11 +424,17 @@ async function refreshData() {
         primaryGroupCol = headers[colMap.hall] || headers[0] || "";
         sortCol = headers[colMap.name] || headers[0] || "";
         
-        // Find default secondary column (camp stay/status)
         let secCandidate = headers.find(h => /camp stay|stay type|status|registration/i.test(h));
         secondaryGroupCol = secCandidate || "__NONE__";
 
         populateSettingsDropdowns();
+
+        // Load state from URL hash on initial load
+        if (!isInitializedFromHash) {
+            loadStateFromHash();
+            isInitializedFromHash = true;
+        }
+
         renderApp();
     } catch (err) {
         console.error(err);
@@ -446,10 +443,150 @@ async function refreshData() {
     }
 }
 
+function parseHashParams() {
+    let hash = window.location.hash.substring(1);
+    let params = {};
+    if (!hash) return params;
+    hash.split('&').forEach(part => {
+        let item = part.split('=');
+        if (item.length === 2) {
+            params[decodeURIComponent(item[0])] = decodeURIComponent(item[1]);
+        }
+    });
+    return params;
+}
+
+function loadStateFromHash() {
+    let params = parseHashParams();
+    if (Object.keys(params).length === 0) return;
+
+    // 1. View Mode
+    if (params.mode !== undefined) {
+        let m = parseInt(params.mode);
+        if (m >= 0 && m <= 3) {
+            let radio = document.getElementById('vm' + m);
+            if (radio) radio.checked = true;
+        }
+    }
+
+    // 2. Halls filter
+    if (params.halls !== undefined) {
+        let hallsList = params.halls.split(',').map(h => h.trim());
+        selectedHalls.clear();
+        hallsList.forEach(h => {
+            if (allHalls.includes(h)) selectedHalls.add(h);
+        });
+        if (selectedHalls.size === 0) selectedHalls = new Set(allHalls);
+        
+        let btn = document.getElementById('btnHalls');
+        if (selectedHalls.size === allHalls.length) btn.innerText = "📍 Halls: All";
+        else if (selectedHalls.size === 0) btn.innerText = "📍 Halls: None";
+        else btn.innerText = `📍 Halls: (${selectedHalls.size})`;
+    }
+
+    // 3. Transport filter
+    if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
+        transportFilter = params.trans;
+        let shortTitle = transportFilter.replace(" Only", "");
+        document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
+    }
+
+    // 4. Search query
+    if (params.search !== undefined) {
+        document.getElementById('searchInput').value = params.search;
+    }
+
+    // 5. Settings (Primary, Secondary, Sort, Dir)
+    if (params.primary !== undefined && headers.includes(params.primary)) {
+        primaryGroupCol = params.primary;
+    }
+    if (params.secondary !== undefined && (params.secondary === "__NONE__" || headers.includes(params.secondary))) {
+        secondaryGroupCol = params.secondary;
+    }
+    if (params.sort !== undefined && headers.includes(params.sort)) {
+        sortCol = params.sort;
+    }
+    if (params.dir !== undefined) {
+        sortAscending = (params.dir === "asc");
+    }
+
+    populateSettingsDropdowns();
+}
+
+function updateUrlHash() {
+    let modeEl = document.querySelector('input[name="viewMode"]:checked');
+    let mode = modeEl ? modeEl.value : "0";
+    let searchVal = document.getElementById('searchInput').value.trim();
+    let hallsVal = Array.from(selectedHalls).join(',');
+
+    let params = [];
+    params.push("mode=" + mode);
+    if (selectedHalls.size < allHalls.length) {
+        params.push("halls=" + encodeURIComponent(hallsVal));
+    }
+    if (transportFilter !== "All") {
+        params.push("trans=" + encodeURIComponent(transportFilter));
+    }
+    if (searchVal) {
+        params.push("search=" + encodeURIComponent(searchVal));
+    }
+    if (primaryGroupCol && primaryGroupCol !== headers[colMap.hall]) {
+        params.push("primary=" + encodeURIComponent(primaryGroupCol));
+    }
+    if (secondaryGroupCol !== "__NONE__") {
+        params.push("secondary=" + encodeURIComponent(secondaryGroupCol));
+    }
+    if (sortCol && sortCol !== headers[colMap.name]) {
+        params.push("sort=" + encodeURIComponent(sortCol));
+    }
+    if (!sortAscending) {
+        params.push("dir=desc");
+    }
+
+    let newHash = "#" + params.join("&");
+    if (window.location.hash !== newHash) {
+        history.replaceState(null, "", newHash);
+    }
+}
+
+function copyShareableLink() {
+    updateUrlHash();
+    let currentUrl = window.location.href;
+    
+    // Fallback clipboard command
+    const textarea = document.createElement("textarea");
+    textarea.value = currentUrl;
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+        document.execCommand('copy');
+        showToast("🔗 Shareable link copied to clipboard!");
+    } catch (err) {
+        showToast("⚠️ Could not copy link automatically.");
+    }
+    document.body.removeChild(textarea);
+}
+
+function showToast(message) {
+    let container = document.getElementById('toastContainer');
+    let toast = document.createElement('div');
+    toast.className = "toast align-items-center text-white bg-dark border-0 show shadow";
+    toast.role = "alert";
+    toast.innerHTML = `
+        <div class="d-flex">
+            <div class="toast-body">${message}</div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" onclick="this.closest('.toast').remove()"></button>
+        </div>
+    `;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 3000);
+}
+
 function populateSettingsDropdowns() {
     let selP = document.getElementById('selPrimaryGroup');
     let selS = document.getElementById('selSecondaryGroup');
     let selSort = document.getElementById('selSortCol');
+    let selDir = document.getElementById('selSortDir');
 
     selP.innerHTML = "";
     selS.innerHTML = '<option value="__NONE__">(None / Disabled)</option>';
@@ -465,6 +602,8 @@ function populateSettingsDropdowns() {
         selS.add(opt2);
         selSort.add(opt3);
     });
+
+    selDir.value = sortAscending ? "asc" : "desc";
 }
 
 function saveSettings() {
@@ -515,6 +654,8 @@ function setTransportFilter(filterVal) {
 }
 
 function renderApp() {
+    updateUrlHash();
+
     let modeEl = document.querySelector('input[name="viewMode"]:checked');
     let mode = modeEl ? parseInt(modeEl.value) : 0;
     let query = (document.getElementById('searchInput').value || "").toLowerCase().trim();
