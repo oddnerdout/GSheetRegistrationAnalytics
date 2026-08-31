@@ -153,8 +153,8 @@ HTML_TEMPLATE = """
         }
         .btn-segment {
             font-weight: 600;
-            font-size: 0.85rem;
-            padding: 6px 10px;
+            font-size: 0.8rem;
+            padding: 5px 6px;
         }
         .card-header-g1 { 
             font-weight: bold; 
@@ -235,13 +235,41 @@ HTML_TEMPLATE = """
         .list-group-item:active { background-color: #e5e5ea; }
         .dense-row { padding: 6px 12px; }
         .hall-checkbox-item { cursor: pointer; }
+        .matrix-table-container {
+            overflow-x: auto;
+            background: #ffffff;
+            border-radius: 8px;
+            border: 1px solid #d1d1d6;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .table-matrix th, .table-matrix td {
+            text-align: center;
+            font-size: 0.85rem;
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+        .table-matrix th:first-child, .table-matrix td:first-child {
+            text-align: left;
+            font-weight: 600;
+        }
+        .matrix-title {
+            font-size: 1rem;
+            font-weight: bold;
+            color: #1f2d3d;
+            padding: 10px 12px;
+            background-color: #f8f9fa;
+            border-bottom: 1px solid #e5e5ea;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }
     </style>
 </head>
 <body>
 
 <div class="sticky-top-panel shadow-sm">
     <div class="container-fluid px-1">
-        <!-- Row 1: Segment Controller -->
+        <!-- Row 1: Segment Controller (Expanded to 5 views) -->
         <div class="btn-group w-100 mb-2 shadow-none" role="group">
             <input type="radio" class="btn-check" name="viewMode" id="vm0" value="0" checked onchange="renderApp()">
             <label class="btn btn-outline-primary btn-segment" for="vm0">Classic</label>
@@ -254,6 +282,9 @@ HTML_TEMPLATE = """
 
             <input type="radio" class="btn-check" name="viewMode" id="vm3" value="3" onchange="renderApp()">
             <label class="btn btn-outline-primary btn-segment" for="vm3">To NYC 🚐</label>
+
+            <input type="radio" class="btn-check" name="viewMode" id="vm4" value="4" onchange="renderApp()">
+            <label class="btn btn-outline-primary btn-segment" for="vm4">📊 Matrix</label>
         </div>
 
         <!-- Row 2: Filter Buttons (Halls & Transport) -->
@@ -429,7 +460,6 @@ async function refreshData() {
 
         populateSettingsDropdowns();
 
-        // Load state from URL hash on initial load
         if (!isInitializedFromHash) {
             loadStateFromHash();
             isInitializedFromHash = true;
@@ -460,16 +490,14 @@ function loadStateFromHash() {
     let params = parseHashParams();
     if (Object.keys(params).length === 0) return;
 
-    // 1. View Mode
     if (params.mode !== undefined) {
         let m = parseInt(params.mode);
-        if (m >= 0 && m <= 3) {
+        if (m >= 0 && m <= 4) {
             let radio = document.getElementById('vm' + m);
             if (radio) radio.checked = true;
         }
     }
 
-    // 2. Halls filter
     if (params.halls !== undefined) {
         let hallsList = params.halls.split(',').map(h => h.trim());
         selectedHalls.clear();
@@ -484,19 +512,16 @@ function loadStateFromHash() {
         else btn.innerText = `📍 Halls: (${selectedHalls.size})`;
     }
 
-    // 3. Transport filter
     if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
         transportFilter = params.trans;
         let shortTitle = transportFilter.replace(" Only", "");
         document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
     }
 
-    // 4. Search query
     if (params.search !== undefined) {
         document.getElementById('searchInput').value = params.search;
     }
 
-    // 5. Settings (Primary, Secondary, Sort, Dir)
     if (params.primary !== undefined && headers.includes(params.primary)) {
         primaryGroupCol = params.primary;
     }
@@ -553,7 +578,6 @@ function copyShareableLink() {
     updateUrlHash();
     let currentUrl = window.location.href;
     
-    // Fallback clipboard command
     const textarea = document.createElement("textarea");
     textarea.value = currentUrl;
     document.body.appendChild(textarea);
@@ -653,6 +677,16 @@ function setTransportFilter(filterVal) {
     renderApp();
 }
 
+function abbreviateLocality(name) {
+    if (!name) return "N/A";
+    let cleaned = name.replace(/church in/gi, "").replace(/locality/gi, "").trim();
+    let words = cleaned.split(/\s+/);
+    if (words.length === 1) {
+        return words[0].substring(0, 6).toUpperCase();
+    }
+    return words.map(w => w[0]).join("").toUpperCase();
+}
+
 function renderApp() {
     updateUrlHash();
 
@@ -709,21 +743,6 @@ function renderApp() {
         }
     });
 
-    // 3. PRECOMPUTE COUNTS PER GROUP
-    let primaryCounts = {};
-    let secondaryCounts = {};
-    filtered.forEach(r => {
-        let valG1 = pIdx >= 0 ? (r.data[pIdx] || "(Empty)").trim() : "All Attendees";
-        let valG2 = sIdx >= 0 ? (r.data[sIdx] || "").trim() : "";
-        
-        primaryCounts[valG1] = (primaryCounts[valG1] || 0) + 1;
-        if (valG2) {
-            let compositeKey = valG1 + "|||" + valG2;
-            secondaryCounts[compositeKey] = (secondaryCounts[compositeKey] || 0) + 1;
-        }
-    });
-
-    // 4. RENDERING
     let container = document.getElementById('contentList');
     container.innerHTML = "";
 
@@ -732,11 +751,190 @@ function renderApp() {
         return;
     }
 
+    if (mode === 4) {
+        // --- MATRIX ANALYTICS VIEW (Mode 4) ---
+        let localitiesSet = new Set();
+        filtered.forEach(r => {
+            let h = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            localitiesSet.add(h);
+        });
+        let localities = Array.from(localitiesSet).sort();
+
+        // Table 1 Data: Attendee Matrix (Arrival vs Departure)
+        let arrivalsList = ["Friday", "Saturday", "Sunday (Lord's Day)"];
+        let departuresList = ["Saturday", "Sunday (Lord's Day)", "Friday (Day Only)"];
+        
+        let t1Matrix = {}; // loc -> { arrive -> { depart -> count } }
+        let t1ColTotals = {};
+        let t1GrandTotal = 0;
+
+        localities.forEach(loc => {
+            t1Matrix[loc] = {};
+            arrivalsList.forEach(arr => {
+                t1Matrix[loc][arr] = {};
+                departuresList.forEach(dep => {
+                    t1Matrix[loc][arr][dep] = 0;
+                });
+            });
+        });
+
+        filtered.forEach(r => {
+            let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            let arr = r._arrive;
+            let dep = r._depart;
+            if (!t1Matrix[loc]) t1Matrix[loc] = { [arr]: { [dep]: 0 } };
+            if (!t1Matrix[loc][arr]) t1Matrix[loc][arr] = {};
+            t1Matrix[loc][arr][dep] = (t1Matrix[loc][arr][dep] || 0) + 1;
+            
+            t1ColTotals[dep] = (t1ColTotals[dep] || 0) + 1;
+            t1GrandTotal++;
+        });
+
+        // Build Table 1 HTML
+        let html = `<div class="matrix-title">📋 1. Attendee Counts Matrix (Arrival ➔ Departure)</div>`;
+        html += `<div class="matrix-table-container"><table class="table table-bordered table-sm table-matrix mb-0">`;
+        html += `<thead class="table-light"><tr><th>Locality</th>`;
+        departuresList.forEach(dep => { html += `<th>${dep}</th>`; });
+        html += `<th>Row Total</th></tr></thead><tbody>`;
+
+        localities.forEach(loc => {
+            let abbr = abbreviateLocality(loc);
+            html += `<tr><td title="${loc}">${abbr}</td>`;
+            let rowTotal = 0;
+            departuresList.forEach(dep => {
+                let cellSum = 0;
+                arrivalsList.forEach(arr => {
+                    cellSum += (t1Matrix[loc][arr] && t1Matrix[loc][arr][dep]) ? t1Matrix[loc][arr][dep] : 0;
+                });
+                rowTotal += cellSum;
+                html += `<td>${cellSum > 0 ? cellSum : '-'}</td>`;
+            });
+            html += `<td class="fw-bold bg-light">${rowTotal}</td></tr>`;
+        });
+
+        // Table 1 Column Totals
+        html += `<tr class="table-secondary fw-bold"><td>Column Total</td>`;
+        departuresList.forEach(dep => {
+            html += `<td>${t1ColTotals[dep] || 0}</td>`;
+        });
+        html += `<td>${t1GrandTotal}</td></tr>`;
+        html += `</tbody></table></div>`;
+
+        // Table 2 Data: Ride Requests to Camp Matrix
+        let t2Matrix = {};
+        let t2ColTotals = {};
+        let t2GrandTotal = 0;
+
+        localities.forEach(loc => {
+            t2Matrix[loc] = {};
+            arrivalsList.forEach(arr => {
+                t2Matrix[loc][arr] = {};
+                departuresList.forEach(dep => {
+                    t2Matrix[loc][arr][dep] = 0;
+                });
+            });
+        });
+
+        filtered.forEach(r => {
+            if (!r._tstate.is_ride_req) return;
+            let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            let arr = r._arrive;
+            let dep = r._depart;
+            if (!t2Matrix[loc][arr]) t2Matrix[loc][arr] = {};
+            t2Matrix[loc][arr][dep] = (t2Matrix[loc][arr][dep] || 0) + 1;
+            
+            t2ColTotals[dep] = (t2ColTotals[dep] || 0) + 1;
+            t2GrandTotal++;
+        });
+
+        html += `<div class="matrix-title mt-4">🚐 2. Ride Requests to Camp Matrix</div>`;
+        html += `<div class="matrix-table-container"><table class="table table-bordered table-sm table-matrix mb-0">`;
+        html += `<thead class="table-light"><tr><th>Locality</th>`;
+        departuresList.forEach(dep => { html += `<th>${dep}</th>`; });
+        html += `<th>Row Total</th></tr></thead><tbody>`;
+
+        localities.forEach(loc => {
+            let abbr = abbreviateLocality(loc);
+            html += `<tr><td title="${loc}">${abbr}</td>`;
+            let rowTotal = 0;
+            departuresList.forEach(dep => {
+                let cellSum = 0;
+                arrivalsList.forEach(arr => {
+                    cellSum += (t2Matrix[loc][arr] && t2Matrix[loc][arr][dep]) ? t2Matrix[loc][arr][dep] : 0;
+                });
+                rowTotal += cellSum;
+                html += `<td>${cellSum > 0 ? cellSum : '-'}</td>`;
+            });
+            html += `<td class="fw-bold bg-light">${rowTotal}</td></tr>`;
+        });
+
+        html += `<tr class="table-secondary fw-bold"><td>Column Total</td>`;
+        departuresList.forEach(dep => {
+            html += `<td>${t2ColTotals[dep] || 0}</td>`;
+        });
+        html += `<td>${t2GrandTotal}</td></tr>`;
+        html += `</tbody></table></div>`;
+
+        // Table 3 Data: District Summary Breakdown
+        let districtColIdx = find_col_idx(headers, ["district", "region", "area"], -1);
+        let districtCounts = {};
+        let districtLocalityCounts = {};
+        let totalCount = 0;
+
+        filtered.forEach(r => {
+            let dist = districtColIdx >= 0 ? (r.data[districtColIdx] || "General District").trim() : "General District";
+            let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            
+            districtCounts[dist] = (districtCounts[dist] || 0) + 1;
+            if (!districtLocalityCounts[dist]) districtLocalityCounts[dist] = {};
+            districtLocalityCounts[dist][loc] = (districtLocalityCounts[dist][loc] || 0) + 1;
+            totalCount++;
+        });
+
+        html += `<div class="matrix-title mt-4">🏛️ 3. District & Locality Breakdown</div>`;
+        html += `<div class="matrix-table-container"><table class="table table-bordered table-sm table-matrix mb-0">`;
+        html += `<thead class="table-light"><tr><th>District</th><th>Locality</th><th>Count</th></tr></thead><tbody>`;
+
+        Object.keys(districtLocalityCounts).sort().forEach(dist => {
+            let locs = districtLocalityCounts[dist];
+            let locKeys = Object.keys(locs).sort();
+            let first = true;
+            locKeys.forEach(loc => {
+                html += `<tr>`;
+                if (first) {
+                    html += `<td rowspan="${locKeys.length}" class="fw-bold bg-white align-middle">${dist}</td>`;
+                    first = false;
+                }
+                html += `<td>${loc}</td><td class="fw-semibold">${locs[loc]}</td></tr>`;
+            });
+            html += `<tr class="table-light fw-bold"><td>Total for ${dist}</td><td></td><td>${districtCounts[dist]}</td></tr>`;
+        });
+
+        html += `<tr class="table-secondary fw-bold"><td colspan="2">Grand Total Attendees</td><td>${totalCount}</td></tr>`;
+        html += `</tbody></table></div>`;
+
+        container.innerHTML = html;
+        return;
+    }
+
     if (mode === 0 || mode === 1) {
         // Classic (0) or Dense Roster (1)
         let curG1 = null;
         let curG2 = null;
         let currentList = null;
+
+        let primaryCounts = {};
+        let secondaryCounts = {};
+        filtered.forEach(r => {
+            let valG1 = pIdx >= 0 ? (r.data[pIdx] || "(Empty)").trim() : "All Attendees";
+            let valG2 = sIdx >= 0 ? (r.data[sIdx] || "").trim() : "";
+            
+            primaryCounts[valG1] = (primaryCounts[valG1] || 0) + 1;
+            if (valG2) {
+                let compositeKey = valG1 + "|||" + valG2;
+                secondaryCounts[compositeKey] = (secondaryCounts[compositeKey] || 0) + 1;
+            }
+        });
 
         filtered.forEach(r => {
             let valG1 = pIdx >= 0 ? (r.data[pIdx] || "(Empty)").trim() : "All Attendees";
@@ -781,14 +979,12 @@ function renderApp() {
             let status = colMap.status >= 0 ? (r.data[colMap.status] || "") : "";
 
             if (mode === 1) {
-                // Dense Mode
                 item.className += " dense-row d-flex justify-content-between align-items-center";
                 item.innerHTML = `
                     <span class="fw-bold fs-6 text-truncate me-2">${name}</span>
                     <small class="text-muted text-end text-truncate">${status}</small>
                 `;
             } else {
-                // Classic Mode
                 let subParts = [];
                 let tState = r._tstate;
                 if (tState.is_driver) {
@@ -834,7 +1030,6 @@ function renderApp() {
             groupMath[grp].rows.push(r);
         });
 
-        // Ensure chronological display order
         let sortedGroups = Object.keys(groupMath).sort((a, b) => {
             return (timeWeights[a] || 99) - (timeWeights[b] || 99);
         });
