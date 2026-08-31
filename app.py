@@ -1,46 +1,64 @@
-import os
 import csv
-import urllib.request
 import io
+import os
 import re
-from flask import Flask, render_template_string, request, jsonify
+import urllib.request
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
 # Securely retrieve Sheet ID from Environment Variables
-# Set a default fallback for local development if needed
+# Set your fallback Sheet ID for local testing if needed
+SHEET_ID = os.environ.get("SHEET_ID", "").strip()
 
 
 def fetch_sheet_data():
     """Downloads and parses the Google Sheet from the hidden SHEET_ID."""
+    if not SHEET_ID:
+        print("[Error] SHEET_ID environment variable is not set.")
+        return [], []
+
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            csv_string_data = response.read().decode('utf-8')
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/115.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            csv_string_data = response.read().decode("utf-8")
 
         csv_reader = csv.reader(io.StringIO(csv_string_data))
         raw_rows = list(csv_reader)
-        
+
         if len(raw_rows) < 4:
+            print("[Warning] Sheet has fewer than 4 rows.")
             return [], []
-            
+
         headers = [h.strip() for h in raw_rows[3]]
         data_rows = raw_rows[4:] if len(raw_rows) > 4 else []
         cleaned_rows = [r for r in data_rows if any(cell.strip() for cell in r)]
-        
+
         return headers, cleaned_rows
     except Exception as e:
-        print(f"Error fetching sheet: {e}")
+        print(f"[Error] Failed fetching or parsing Google Sheet: {e}")
         return [], []
 
+
 def find_col_idx(headers, keywords, fallback):
-    if isinstance(keywords, str): keywords = [keywords]
+    if isinstance(keywords, str):
+        keywords = [keywords]
     for kw in keywords:
         for idx, h in enumerate(headers):
             if kw.lower() in str(h).lower():
                 return idx
     return fallback
+
 
 def parse_transport_state(row, col_drive, col_ride, col_space):
     def get_val(idx):
@@ -54,37 +72,51 @@ def parse_transport_state(row, col_drive, col_ride, col_space):
     r_lower = ride_val.lower()
     s_lower = space_val.lower()
 
-    explicit_driver_yes = (d_lower.startswith('y') or d_lower == 'true' or 'driver' in d_lower)
-    explicit_driver_no = (d_lower.startswith('n') or d_lower == 'false' or 'none' in d_lower)
-
-    has_valid_space = bool(space_val) and not (
-        s_lower in ['0', 'none', 'n/a', 'na', 'no', 'nil', '-'] or 
-        'no space' in s_lower or 'no vehicle' in s_lower
+    explicit_driver_yes = (
+        d_lower.startswith("y") or d_lower == "true" or "driver" in d_lower
+    )
+    explicit_driver_no = (
+        d_lower.startswith("n") or d_lower == "false" or "none" in d_lower
     )
 
-    is_driver = explicit_driver_yes or (has_valid_space and not explicit_driver_no)
-    is_ride_req = (r_lower.startswith('y') or r_lower == 'true' or 'yes' in r_lower)
+    has_valid_space = bool(space_val) and not (
+        s_lower in ["0", "none", "n/a", "na", "no", "nil", "-"]
+        or "no space" in s_lower
+        or "no vehicle" in s_lower
+    )
+
+    is_driver = explicit_driver_yes or (
+        has_valid_space and not explicit_driver_no
+    )
+    is_ride_req = (
+        r_lower.startswith("y") or r_lower == "true" or "yes" in r_lower
+    )
 
     seat_count = 0
     if is_driver and has_valid_space:
-        nums = re.findall(r'\d+', space_val)
+        nums = re.findall(r"\d+", space_val)
         if nums:
             seat_count = int(nums[0])
-        elif 'van' in s_lower:
-            seat_count = 6 
+        elif "van" in s_lower:
+            seat_count = 6
 
     return {
-        'is_driver': is_driver,
-        'explicit_driver_no': explicit_driver_no,
-        'space_val': space_val,
-        'seat_count': seat_count,
-        'has_valid_space': has_valid_space,
-        'is_ride_req': is_ride_req
+        "is_driver": is_driver,
+        "explicit_driver_no": explicit_driver_no,
+        "space_val": space_val,
+        "seat_count": seat_count,
+        "has_valid_space": has_valid_space,
+        "is_ride_req": is_ride_req,
     }
+
 
 def infer_timing(status_val):
     status = status_val.lower()
-    if "full time" in status or "full-time" in status or "all weekend" in status:
+    if (
+        "full time" in status
+        or "full-time" in status
+        or "all weekend" in status
+    ):
         return "Friday", "Sunday (Lord's Day)"
     elif "friday" in status and "overnight" in status:
         return "Friday", "Saturday"
@@ -92,13 +124,16 @@ def infer_timing(status_val):
         return "Saturday", "Sunday (Lord's Day)"
     elif "friday" in status:
         return "Friday", "Friday (Day Only)"
-    elif "saturday" in status and ("day" in status or "offsite" in status or "day-only" in status):
+    elif "saturday" in status and (
+        "day" in status or "offsite" in status or "day-only" in status
+    ):
         return "Saturday", "Saturday"
     elif "saturday" in status:
         return "Saturday", "Saturday (Day Only)"
     elif "sunday" in status or "lord's day" in status:
         return "Sunday (Lord's Day)", "Sunday (Lord's Day)"
     return "Unknown Timing", "Unknown Timing"
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -148,6 +183,7 @@ HTML_TEMPLATE = """
 </div>
 
 <div class="container py-2">
+    <div id="statusAlert" class="alert alert-warning d-none" role="alert"></div>
     <div id="contentList"></div>
 </div>
 
@@ -171,45 +207,63 @@ let headers = [];
 let colMap = {};
 
 async function loadData() {
-    let res = await fetch('/api/data');
-    let json = await res.json();
-    rawData = json.rows;
-    headers = json.headers;
-    colMap = json.col_map;
-    
-    // Populate Halls Dropdown
-    let halls = new Set();
-    rawData.forEach(r => {
-        let h = r[colMap.hall] ? r[colMap.hall].trim() : "";
-        if(h) halls.add(h);
-    });
-    let hallSelect = document.getElementById('hallFilter');
-    Array.from(halls).sort().forEach(h => {
-        let opt = document.createElement('option');
-        opt.value = h;
-        opt.innerText = "📍 Hall: " + h;
-        hallSelect.appendChild(opt);
-    });
+    try {
+        let res = await fetch('/api/data');
+        let json = await res.json();
+        rawData = json.rows || [];
+        headers = json.headers || [];
+        colMap = json.col_map || {};
 
-    renderApp();
+        let alertBox = document.getElementById('statusAlert');
+        if (rawData.length === 0) {
+            alertBox.innerText = "No data found. Please verify that the SHEET_ID environment variable is set and the Google Sheet is published/accessible with 'Anyone with the link can view'.";
+            alertBox.classList.remove('d-none');
+            return;
+        } else {
+            alertBox.classList.add('d-none');
+        }
+
+        // Populate Halls Dropdown
+        let halls = new Set();
+        rawData.forEach(r => {
+            let h = (r.data[colMap.hall] || "").trim();
+            if (h) halls.add(h);
+        });
+        
+        let hallSelect = document.getElementById('hallFilter');
+        hallSelect.innerHTML = '<option value="ALL">📍 Halls: All</option>';
+        Array.from(halls).sort().forEach(h => {
+            let opt = document.createElement('option');
+            opt.value = h;
+            opt.innerText = "📍 Hall: " + h;
+            hallSelect.appendChild(opt);
+        });
+
+        renderApp();
+    } catch (err) {
+        let alertBox = document.getElementById('statusAlert');
+        alertBox.innerText = "Failed to load data from server. Check server logs.";
+        alertBox.classList.remove('d-none');
+        console.error(err);
+    }
 }
 
 function renderApp() {
     let mode = parseInt(document.getElementById('viewMode').value);
     let hallFilter = document.getElementById('hallFilter').value;
     let transFilter = document.getElementById('transFilter').value;
-    let query = document.getElementById('searchInput').value.toLowerCase();
+    let query = document.getElementById('searchInput').value.toLowerCase().trim();
 
     let filtered = rawData.filter(r => {
-        let hallVal = r[colMap.hall] ? r[colMap.hall].trim() : "";
-        if(hallFilter !== "ALL" && hallVal !== hallFilter) return false;
+        let hallVal = (r.data[colMap.hall] || "").trim();
+        if (hallFilter !== "ALL" && hallVal !== hallFilter) return false;
 
         let tState = r._tstate;
-        if(transFilter === "DRIVERS" && !(tState.is_driver || tState.has_valid_space)) return false;
-        if(transFilter === "RIDES" && !tState.is_ride_req) return false;
+        if (transFilter === "DRIVERS" && !(tState.is_driver || tState.has_valid_space)) return false;
+        if (transFilter === "RIDES" && !tState.is_ride_req) return false;
 
-        if(query) {
-            return r.some(cell => String(cell).toLowerCase().includes(query));
+        if (query) {
+            return r.data.some(cell => String(cell).toLowerCase().includes(query));
         }
         return true;
     });
@@ -217,19 +271,24 @@ function renderApp() {
     let container = document.getElementById('contentList');
     container.innerHTML = "";
 
-    if(mode === 0 || mode === 1) { // Classic or Dense
+    if (filtered.length === 0) {
+        container.innerHTML = `<div class="text-center text-muted my-4">No matching records found.</div>`;
+        return;
+    }
+
+    if (mode === 0 || mode === 1) { // Classic or Dense View
         let currentGroup = "";
-        let listGroup = document.createElement('div');
-        listGroup.className = "list-group shadow-sm mb-3";
+        let listGroup = null;
 
         filtered.forEach(r => {
-            let gVal = r[colMap.hall] || "All Data";
-            if(gVal !== currentGroup) {
+            let gVal = (r.data[colMap.hall] || "General / Unassigned").trim();
+            if (gVal !== currentGroup) {
                 currentGroup = gVal;
                 let header = document.createElement('div');
                 header.className = "card-header-group bg-secondary text-white";
                 header.innerText = "📍 " + gVal;
                 container.appendChild(header);
+
                 listGroup = document.createElement('div');
                 listGroup.className = "list-group shadow-sm mb-3";
                 container.appendChild(listGroup);
@@ -237,18 +296,18 @@ function renderApp() {
 
             let item = document.createElement('a');
             item.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center";
-            item.onclick = () => showDetail(r);
+            item.onclick = () => showDetail(r.data);
 
-            let name = r[colMap.name] || "(Unnamed)";
-            let status = r[colMap.status] || "";
+            let name = r.data[colMap.name] || "(Unnamed)";
+            let status = r.data[colMap.status] || "";
 
-            if(mode === 1) { // Dense
+            if (mode === 1) { // Dense
                 item.innerHTML = `<span class="fw-bold fs-6">${name}</span> <small class="text-muted">${status}</small>`;
             } else { // Classic
                 let sub = [];
-                if(r._tstate.is_driver) sub.push("🚗 Driver (" + r._tstate.space_val + ")");
-                if(r._tstate.is_ride_req) sub.push("🙋 Need Ride");
-                
+                if (r._tstate.is_driver) sub.push("🚗 Driver (" + (r._tstate.space_val || "Yes") + ")");
+                if (r._tstate.is_ride_req) sub.push("🙋 Need Ride");
+
                 item.innerHTML = `
                     <div>
                         <div class="fw-bold">${name}</div>
@@ -262,9 +321,9 @@ function renderApp() {
         let groupMath = {};
         filtered.forEach(r => {
             let grp = mode === 2 ? r._arrive : r._depart;
-            if(!groupMath[grp]) groupMath[grp] = {needs: 0, seats: 0, rows: []};
-            if(r._tstate.is_ride_req) groupMath[grp].needs++;
-            if(r._tstate.is_driver) groupMath[grp].seats += r._tstate.seat_count;
+            if (!groupMath[grp]) groupMath[grp] = { needs: 0, seats: 0, rows: [] };
+            if (r._tstate.is_ride_req) groupMath[grp].needs++;
+            if (r._tstate.is_driver) groupMath[grp].seats += r._tstate.seat_count;
             groupMath[grp].rows.push(r);
         });
 
@@ -272,10 +331,10 @@ function renderApp() {
             let data = groupMath[grp];
             let deficit = data.needs - data.seats;
             let header = document.createElement('div');
-            
+
             let badgeText = deficit > 0 ? `⚠️ Short ${deficit}` : `✅ Surplus ${-deficit}`;
             let bgClass = deficit > 0 ? "bg-danger text-white" : "bg-success text-white";
-            
+
             header.className = `card-header-group ${bgClass} d-flex justify-content-between align-items-center`;
             header.innerHTML = `<span>🕒 ${grp}</span> <small>${badgeText} (Needs: ${data.needs} | Seats: ${data.seats})</small>`;
             container.appendChild(header);
@@ -286,16 +345,16 @@ function renderApp() {
             data.rows.forEach(r => {
                 let item = document.createElement('a');
                 item.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center";
-                item.onclick = () => showDetail(r);
+                item.onclick = () => showDetail(r.data);
 
                 let badge = "";
-                if(r._tstate.is_driver) badge = `<span class="badge-driver">Driver (${r._tstate.space_val})</span>`;
-                else if(r._tstate.is_ride_req) badge = `<span class="badge-req">Need Ride</span>`;
+                if (r._tstate.is_driver) badge = `<span class="badge-driver">🚗 Driver (${r._tstate.space_val})</span>`;
+                else if (r._tstate.is_ride_req) badge = `<span class="badge-req">🙋 Need Ride</span>`;
 
                 item.innerHTML = `
                     <div>
-                        <div class="fw-bold">${r[colMap.name] || "(Unnamed)"}</div>
-                        <small class="text-muted">${r[colMap.status] || ""}</small>
+                        <div class="fw-bold">${r.data[colMap.name] || "(Unnamed)"}</div>
+                        <small class="text-muted">${r.data[colMap.status] || ""}</small>
                     </div>
                     <div>${badge}</div>`;
                 listGroup.appendChild(item);
@@ -310,7 +369,7 @@ function showDetail(row) {
     let body = document.getElementById('modalBody');
     body.innerHTML = "";
     headers.forEach((h, i) => {
-        if(h && row[i]) {
+        if (h && row[i]) {
             body.innerHTML += `<p class="mb-1"><strong>${h}:</strong> ${row[i]}</p>`;
         }
     });
@@ -318,53 +377,81 @@ function showDetail(row) {
     modal.show();
 }
 
+// Initial fetch on page load
 loadData();
 </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+
 @app.route("/api/data")
 def get_data():
     headers, rows = fetch_sheet_data()
-    
-    col_name = find_col_idx(headers, ["full name", "name", "attendee", "participant"], 0)
-    col_hall = find_col_idx(headers, ["locality", "hall", "locality/hall", "church"], -1)
-    col_status = find_col_idx(headers, ["status", "registration type", "attending", "full time", "camp stay", "registration"], -1)
-    col_ride = find_col_idx(headers, ["need a ride", "ride request", "need ride", "passenger"], -1)
-    col_drive = find_col_idx(headers, ["give rides", "driver", "can you drive", "can you give"], -1)
-    col_space = find_col_idx(headers, ["space", "capacity", "seats", "how much space", "vehicle"], -1)
+
+    col_name = find_col_idx(
+        headers, ["full name", "name", "attendee", "participant"], 0
+    )
+    col_hall = find_col_idx(
+        headers, ["locality", "hall", "locality/hall", "church"], -1
+    )
+    col_status = find_col_idx(
+        headers,
+        [
+            "status",
+            "registration type",
+            "attending",
+            "full time",
+            "camp stay",
+            "registration",
+        ],
+        -1,
+    )
+    col_ride = find_col_idx(
+        headers, ["need a ride", "ride request", "need ride", "passenger"], -1
+    )
+    col_drive = find_col_idx(
+        headers, ["give rides", "driver", "can you drive", "can you give"], -1
+    )
+    col_space = find_col_idx(
+        headers,
+        ["space", "capacity", "seats", "how much space", "vehicle"],
+        -1,
+    )
 
     processed_rows = []
     for r in rows:
         tstate = parse_transport_state(r, col_drive, col_ride, col_space)
         status_val = r[col_status] if 0 <= col_status < len(r) else ""
         arrive, depart = infer_timing(status_val)
-        
-        # Attach dynamic backend processing metadata to row
-        r_dict = list(r)
-        r_dict.append(tstate) # _tstate
-        r_dict.append(arrive) # _arrive
-        r_dict.append(depart) # _depart
-        processed_rows.append(r_dict)
 
-    return jsonify({
-        'headers': headers,
-        'rows': [[*r[:-3]] for r in processed_rows],
-        'col_map': {
-            'name': col_name,
-            'hall': col_hall,
-            'status': col_status
+        processed_rows.append(
+            {
+                "data": r,
+                "_tstate": tstate,
+                "_arrive": arrive,
+                "_depart": depart,
+            }
+        )
+
+    return jsonify(
+        {
+            "headers": headers,
+            "rows": processed_rows,
+            "col_map": {
+                "name": col_name,
+                "hall": col_hall,
+                "status": col_status,
+            },
         }
-    })
+    )
 
-# Attach pre-calculated properties on JSON conversion
-@app.template_filter('tstate')
-def get_tstate(r): return r[-3]
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
