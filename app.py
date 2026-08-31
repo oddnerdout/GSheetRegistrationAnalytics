@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # Securely retrieve Sheet ID from Environment Variables
 # Set a default fallback for local development if needed
-SHEET_ID = os.environ.get("SHEET_ID", "1KezPNBDwcZk5aeMzJlAVFnnZkPzFv78WQg3y6EOkOGs")
+SHEET_ID = os.environ.get("SHEET_ID", "")
 
 def fetch_sheet_data():
     """Downloads and parses the Google Sheet from the hidden SHEET_ID."""
