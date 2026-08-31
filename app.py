@@ -109,6 +109,13 @@ def parse_transport_state(row, col_drive, col_ride, col_space):
 
 
 def infer_timing(status_val):
+    """
+    Explicit timing inference:
+    - Part-time sat. Night -> To Camp: Saturday | To NYC: Sunday (Lord's Day)
+    - Part-time fri. Night -> To Camp: Friday   | To NYC: Saturday
+    - Day-only / offsite   -> To Camp: Saturday | To NYC: Saturday
+    - Full time            -> To Camp: Friday   | To NYC: Sunday (Lord's Day)
+    """
     status = status_val.lower().strip()
     
     if "sat" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
@@ -153,8 +160,8 @@ HTML_TEMPLATE = """
         }
         .btn-segment {
             font-weight: 600;
-            font-size: 0.8rem;
-            padding: 5px 6px;
+            font-size: 0.78rem;
+            padding: 6px 4px;
         }
         .card-header-g1 { 
             font-weight: bold; 
@@ -240,7 +247,7 @@ HTML_TEMPLATE = """
             background: #ffffff;
             border-radius: 8px;
             border: 1px solid #d1d1d6;
-            margin-bottom: 20px;
+            margin-bottom: 24px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         }
         .table-matrix th, .table-matrix td {
@@ -254,10 +261,10 @@ HTML_TEMPLATE = """
             font-weight: 600;
         }
         .matrix-title {
-            font-size: 1rem;
+            font-size: 0.95rem;
             font-weight: bold;
             color: #1f2d3d;
-            padding: 10px 12px;
+            padding: 10px 14px;
             background-color: #f8f9fa;
             border-bottom: 1px solid #e5e5ea;
             border-top-left-radius: 8px;
@@ -269,7 +276,7 @@ HTML_TEMPLATE = """
 
 <div class="sticky-top-panel shadow-sm">
     <div class="container-fluid px-1">
-        <!-- Row 1: Segment Controller (Expanded to 5 views) -->
+        <!-- Row 1: Segment Controller (5 distinct views) -->
         <div class="btn-group w-100 mb-2 shadow-none" role="group">
             <input type="radio" class="btn-check" name="viewMode" id="vm0" value="0" checked onchange="renderApp()">
             <label class="btn btn-outline-primary btn-segment" for="vm0">Classic</label>
@@ -425,6 +432,29 @@ let secondaryGroupCol = "";
 let sortCol = "";
 let sortAscending = true;
 let isInitializedFromHash = false;
+
+// Client-side helper function to locate column index by keyword
+function jsFindColIdx(headerList, keywords, fallback) {
+    if (!Array.isArray(keywords)) keywords = [keywords];
+    for (let kw of keywords) {
+        for (let i = 0; i < headerList.length; i++) {
+            if (headerList[i] && headerList[i].toLowerCase().includes(kw.toLowerCase())) {
+                return i;
+            }
+        }
+    }
+    return fallback;
+}
+
+function abbreviateLocality(name) {
+    if (!name || name === "Unassigned" || name === "All Data") return name || "N/A";
+    let cleaned = name.replace(/church in/gi, "").replace(/locality/gi, "").replace(/hall/gi, "").trim();
+    let words = cleaned.split(/[\s\-\/\,]+/).filter(w => w.length > 0);
+    if (words.length === 1) {
+        return words[0].substring(0, 6).toUpperCase();
+    }
+    return words.map(w => w[0]).join("").toUpperCase();
+}
 
 async function refreshData() {
     let alertBox = document.getElementById('statusAlert');
@@ -677,16 +707,6 @@ function setTransportFilter(filterVal) {
     renderApp();
 }
 
-function abbreviateLocality(name) {
-    if (!name) return "N/A";
-    let cleaned = name.replace(/church in/gi, "").replace(/locality/gi, "").trim();
-    let words = cleaned.split(/\s+/);
-    if (words.length === 1) {
-        return words[0].substring(0, 6).toUpperCase();
-    }
-    return words.map(w => w[0]).join("").toUpperCase();
-}
-
 function renderApp() {
     updateUrlHash();
 
@@ -751,174 +771,262 @@ function renderApp() {
         return;
     }
 
+    // ==========================================
+    // VIEW 4: AT-A-GLANCE MATRIX ANALYTICS
+    // ==========================================
     if (mode === 4) {
-        // --- MATRIX ANALYTICS VIEW (Mode 4) ---
         let localitiesSet = new Set();
         filtered.forEach(r => {
             let h = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
-            localitiesSet.add(h);
+            if (h) localitiesSet.add(h);
         });
         let localities = Array.from(localitiesSet).sort();
+        if (localities.length === 0) localities = ["All Data"];
 
-        // Table 1 Data: Attendee Matrix (Arrival vs Departure)
-        let arrivalsList = ["Friday", "Saturday", "Sunday (Lord's Day)"];
-        let departuresList = ["Saturday", "Sunday (Lord's Day)", "Friday (Day Only)"];
-        
-        let t1Matrix = {}; // loc -> { arrive -> { depart -> count } }
-        let t1ColTotals = {};
+        // Defined Timing Slots
+        let timingColumns = [
+            { id: "fri_sun", label: "Fri ➔ Sun", arrive: "Friday", depart: "Sunday (Lord's Day)" },
+            { id: "sat_sun", label: "Sat ➔ Sun", arrive: "Saturday", depart: "Sunday (Lord's Day)" },
+            { id: "fri_sat", label: "Fri ➔ Sat", arrive: "Friday", depart: "Saturday" },
+            { id: "sat_sat", label: "Sat ➔ Sat", arrive: "Saturday", depart: "Saturday" },
+            { id: "other", label: "Other/Day", arrive: null, depart: null }
+        ];
+
+        // --- TABLE 1: Attendee Counts by Locality & Timing ---
+        let t1Counts = {};
+        let t1ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
         let t1GrandTotal = 0;
 
         localities.forEach(loc => {
-            t1Matrix[loc] = {};
-            arrivalsList.forEach(arr => {
-                t1Matrix[loc][arr] = {};
-                departuresList.forEach(dep => {
-                    t1Matrix[loc][arr][dep] = 0;
-                });
-            });
+            t1Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
         });
 
         filtered.forEach(r => {
             let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            if (!t1Counts[loc]) {
+                t1Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
+            }
+
             let arr = r._arrive;
             let dep = r._depart;
-            if (!t1Matrix[loc]) t1Matrix[loc] = { [arr]: { [dep]: 0 } };
-            if (!t1Matrix[loc][arr]) t1Matrix[loc][arr] = {};
-            t1Matrix[loc][arr][dep] = (t1Matrix[loc][arr][dep] || 0) + 1;
-            
-            t1ColTotals[dep] = (t1ColTotals[dep] || 0) + 1;
+            let slot = "other";
+
+            if (arr === "Friday" && dep === "Sunday (Lord's Day)") slot = "fri_sun";
+            else if (arr === "Saturday" && dep === "Sunday (Lord's Day)") slot = "sat_sun";
+            else if (arr === "Friday" && dep === "Saturday") slot = "fri_sat";
+            else if (arr === "Saturday" && (dep === "Saturday" || dep === "Saturday (Day Only)")) slot = "sat_sat";
+
+            t1Counts[loc][slot]++;
+            t1Counts[loc].rowTotal++;
+            t1ColTotals[slot]++;
             t1GrandTotal++;
         });
 
-        // Build Table 1 HTML
-        let html = `<div class="matrix-title">📋 1. Attendee Counts Matrix (Arrival ➔ Departure)</div>`;
-        html += `<div class="matrix-table-container"><table class="table table-bordered table-sm table-matrix mb-0">`;
-        html += `<thead class="table-light"><tr><th>Locality</th>`;
-        departuresList.forEach(dep => { html += `<th>${dep}</th>`; });
-        html += `<th>Row Total</th></tr></thead><tbody>`;
+        let html = `
+            <div class="matrix-title">📋 1. Attendee Counts (Locality × Timing)</div>
+            <div class="matrix-table-container">
+                <table class="table table-bordered table-sm table-matrix table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Locality (Abbr)</th>
+                            <th>Fri ➔ Sun<br><small class="text-muted">Full-Time</small></th>
+                            <th>Sat ➔ Sun<br><small class="text-muted">Sat Night</small></th>
+                            <th>Fri ➔ Sat<br><small class="text-muted">Fri Night</small></th>
+                            <th>Sat ➔ Sat<br><small class="text-muted">Day-Only</small></th>
+                            <th>Other</th>
+                            <th class="table-secondary">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
 
         localities.forEach(loc => {
             let abbr = abbreviateLocality(loc);
-            html += `<tr><td title="${loc}">${abbr}</td>`;
-            let rowTotal = 0;
-            departuresList.forEach(dep => {
-                let cellSum = 0;
-                arrivalsList.forEach(arr => {
-                    cellSum += (t1Matrix[loc][arr] && t1Matrix[loc][arr][dep]) ? t1Matrix[loc][arr][dep] : 0;
-                });
-                rowTotal += cellSum;
-                html += `<td>${cellSum > 0 ? cellSum : '-'}</td>`;
-            });
-            html += `<td class="fw-bold bg-light">${rowTotal}</td></tr>`;
+            let row = t1Counts[loc];
+            html += `
+                <tr>
+                    <td title="${loc}"><span class="badge bg-light text-dark border me-1">${abbr}</span> <small class="text-muted">${loc}</small></td>
+                    <td>${row.fri_sun || '-'}</td>
+                    <td>${row.sat_sun || '-'}</td>
+                    <td>${row.fri_sat || '-'}</td>
+                    <td>${row.sat_sat || '-'}</td>
+                    <td>${row.other || '-'}</td>
+                    <td class="fw-bold bg-light">${row.rowTotal}</td>
+                </tr>
+            `;
         });
 
-        // Table 1 Column Totals
-        html += `<tr class="table-secondary fw-bold"><td>Column Total</td>`;
-        departuresList.forEach(dep => {
-            html += `<td>${t1ColTotals[dep] || 0}</td>`;
-        });
-        html += `<td>${t1GrandTotal}</td></tr>`;
-        html += `</tbody></table></div>`;
+        html += `
+                    <tr class="table-secondary fw-bold">
+                        <td>Grand Total</td>
+                        <td>${t1ColTotals.fri_sun}</td>
+                        <td>${t1ColTotals.sat_sun}</td>
+                        <td>${t1ColTotals.fri_sat}</td>
+                        <td>${t1ColTotals.sat_sat}</td>
+                        <td>${t1ColTotals.other}</td>
+                        <td class="table-dark">${t1GrandTotal}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        `;
 
-        // Table 2 Data: Ride Requests to Camp Matrix
-        let t2Matrix = {};
-        let t2ColTotals = {};
+        // --- TABLE 2: Ride Requests Matrix ---
+        let t2Counts = {};
+        let t2ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
         let t2GrandTotal = 0;
 
         localities.forEach(loc => {
-            t2Matrix[loc] = {};
-            arrivalsList.forEach(arr => {
-                t2Matrix[loc][arr] = {};
-                departuresList.forEach(dep => {
-                    t2Matrix[loc][arr][dep] = 0;
-                });
-            });
+            t2Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
         });
 
         filtered.forEach(r => {
-            if (!r._tstate.is_ride_req) return;
+            if (!r._tstate || !r._tstate.is_ride_req) return;
             let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            if (!t2Counts[loc]) {
+                t2Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
+            }
+
             let arr = r._arrive;
             let dep = r._depart;
-            if (!t2Matrix[loc][arr]) t2Matrix[loc][arr] = {};
-            t2Matrix[loc][arr][dep] = (t2Matrix[loc][arr][dep] || 0) + 1;
-            
-            t2ColTotals[dep] = (t2ColTotals[dep] || 0) + 1;
+            let slot = "other";
+
+            if (arr === "Friday" && dep === "Sunday (Lord's Day)") slot = "fri_sun";
+            else if (arr === "Saturday" && dep === "Sunday (Lord's Day)") slot = "sat_sun";
+            else if (arr === "Friday" && dep === "Saturday") slot = "fri_sat";
+            else if (arr === "Saturday" && (dep === "Saturday" || dep === "Saturday (Day Only)")) slot = "sat_sat";
+
+            t2Counts[loc][slot]++;
+            t2Counts[loc].rowTotal++;
+            t2ColTotals[slot]++;
             t2GrandTotal++;
         });
 
-        html += `<div class="matrix-title mt-4">🚐 2. Ride Requests to Camp Matrix</div>`;
-        html += `<div class="matrix-table-container"><table class="table table-bordered table-sm table-matrix mb-0">`;
-        html += `<thead class="table-light"><tr><th>Locality</th>`;
-        departuresList.forEach(dep => { html += `<th>${dep}</th>`; });
-        html += `<th>Row Total</th></tr></thead><tbody>`;
+        html += `
+            <div class="matrix-title">🙋 2. Ride Requests to Camp (Locality × Timing)</div>
+            <div class="matrix-table-container">
+                <table class="table table-bordered table-sm table-matrix table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Locality (Abbr)</th>
+                            <th>Fri ➔ Sun</th>
+                            <th>Sat ➔ Sun</th>
+                            <th>Fri ➔ Sat</th>
+                            <th>Sat ➔ Sat</th>
+                            <th>Other</th>
+                            <th class="table-secondary">Total Rides</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
 
         localities.forEach(loc => {
             let abbr = abbreviateLocality(loc);
-            html += `<tr><td title="${loc}">${abbr}</td>`;
-            let rowTotal = 0;
-            departuresList.forEach(dep => {
-                let cellSum = 0;
-                arrivalsList.forEach(arr => {
-                    cellSum += (t2Matrix[loc][arr] && t2Matrix[loc][arr][dep]) ? t2Matrix[loc][arr][dep] : 0;
-                });
-                rowTotal += cellSum;
-                html += `<td>${cellSum > 0 ? cellSum : '-'}</td>`;
-            });
-            html += `<td class="fw-bold bg-light">${rowTotal}</td></tr>`;
+            let row = t2Counts[loc];
+            html += `
+                <tr>
+                    <td title="${loc}"><span class="badge bg-light text-dark border me-1">${abbr}</span> <small class="text-muted">${loc}</small></td>
+                    <td>${row.fri_sun > 0 ? `<strong class="text-danger">${row.fri_sun}</strong>` : '-'}</td>
+                    <td>${row.sat_sun > 0 ? `<strong class="text-danger">${row.sat_sun}</strong>` : '-'}</td>
+                    <td>${row.fri_sat > 0 ? `<strong class="text-danger">${row.fri_sat}</strong>` : '-'}</td>
+                    <td>${row.sat_sat > 0 ? `<strong class="text-danger">${row.sat_sat}</strong>` : '-'}</td>
+                    <td>${row.other > 0 ? `<strong class="text-danger">${row.other}</strong>` : '-'}</td>
+                    <td class="fw-bold bg-light">${row.rowTotal > 0 ? `<span class="badge-req">${row.rowTotal}</span>` : '0'}</td>
+                </tr>
+            `;
         });
 
-        html += `<tr class="table-secondary fw-bold"><td>Column Total</td>`;
-        departuresList.forEach(dep => {
-            html += `<td>${t2ColTotals[dep] || 0}</td>`;
-        });
-        html += `<td>${t2GrandTotal}</td></tr>`;
-        html += `</tbody></table></div>`;
+        html += `
+                    <tr class="table-secondary fw-bold">
+                        <td>Total Requested</td>
+                        <td>${t2ColTotals.fri_sun}</td>
+                        <td>${t2ColTotals.sat_sun}</td>
+                        <td>${t2ColTotals.fri_sat}</td>
+                        <td>${t2ColTotals.sat_sat}</td>
+                        <td>${t2ColTotals.other}</td>
+                        <td class="table-danger text-danger">${t2GrandTotal}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        `;
 
-        // Table 3 Data: District Summary Breakdown
-        let districtColIdx = find_col_idx(headers, ["district", "region", "area"], -1);
-        let districtCounts = {};
-        let districtLocalityCounts = {};
-        let totalCount = 0;
+        // --- TABLE 3: District by Locality Breakdown ---
+        let distIdx = jsFindColIdx(headers, ["district", "region", "area", "zone"], -1);
+        let distMap = {};
+        let totalDistrictAttendees = 0;
 
         filtered.forEach(r => {
-            let dist = districtColIdx >= 0 ? (r.data[districtColIdx] || "General District").trim() : "General District";
+            let dist = distIdx >= 0 ? (r.data[distIdx] || "General / Unassigned").trim() : "All Districts";
             let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
-            
-            districtCounts[dist] = (districtCounts[dist] || 0) + 1;
-            if (!districtLocalityCounts[dist]) districtLocalityCounts[dist] = {};
-            districtLocalityCounts[dist][loc] = (districtLocalityCounts[dist][loc] || 0) + 1;
-            totalCount++;
+            if (!dist) dist = "General / Unassigned";
+
+            if (!distMap[dist]) {
+                distMap[dist] = { total: 0, localities: {} };
+            }
+            distMap[dist].total++;
+            distMap[dist].localities[loc] = (distMap[dist].localities[loc] || 0) + 1;
+            totalDistrictAttendees++;
         });
 
-        html += `<div class="matrix-title mt-4">🏛️ 3. District & Locality Breakdown</div>`;
-        html += `<div class="matrix-table-container"><table class="table table-bordered table-sm table-matrix mb-0">`;
-        html += `<thead class="table-light"><tr><th>District</th><th>Locality</th><th>Count</th></tr></thead><tbody>`;
+        html += `
+            <div class="matrix-title">🏛️ 3. Counts by District & Locality</div>
+            <div class="matrix-table-container">
+                <table class="table table-bordered table-sm table-matrix table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th style="width: 35%;">District</th>
+                            <th style="width: 45%;">Locality</th>
+                            <th style="width: 20%;">Attendee Count</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
 
-        Object.keys(districtLocalityCounts).sort().forEach(dist => {
-            let locs = districtLocalityCounts[dist];
-            let locKeys = Object.keys(locs).sort();
-            let first = true;
+        let sortedDistricts = Object.keys(distMap).sort();
+        sortedDistricts.forEach(dist => {
+            let dData = distMap[dist];
+            let locKeys = Object.keys(dData.localities).sort();
+            let firstRow = true;
+
             locKeys.forEach(loc => {
                 html += `<tr>`;
-                if (first) {
-                    html += `<td rowspan="${locKeys.length}" class="fw-bold bg-white align-middle">${dist}</td>`;
-                    first = false;
+                if (firstRow) {
+                    html += `<td rowspan="${locKeys.length + 1}" class="fw-bold align-middle bg-light">${dist}</td>`;
+                    firstRow = false;
                 }
-                html += `<td>${loc}</td><td class="fw-semibold">${locs[loc]}</td></tr>`;
+                html += `
+                    <td>${loc}</td>
+                    <td>${dData.localities[loc]}</td>
+                </tr>`;
             });
-            html += `<tr class="table-light fw-bold"><td>Total for ${dist}</td><td></td><td>${districtCounts[dist]}</td></tr>`;
+
+            html += `
+                <tr class="table-light fw-bold" style="border-bottom: 2px solid #ced4da;">
+                    <td class="text-end text-muted">Subtotal for ${dist}:</td>
+                    <td class="text-primary">${dData.total}</td>
+                </tr>
+            `;
         });
 
-        html += `<tr class="table-secondary fw-bold"><td colspan="2">Grand Total Attendees</td><td>${totalCount}</td></tr>`;
-        html += `</tbody></table></div>`;
+        html += `
+                    <tr class="table-secondary fw-bold">
+                        <td colspan="2" class="text-end">Grand Total Attendees:</td>
+                        <td class="table-dark">${totalDistrictAttendees}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        `;
 
         container.innerHTML = html;
         return;
     }
 
+    // ==========================================
+    // VIEW 0 & 1: CLASSIC & ROSTER VIEWS
+    // ==========================================
     if (mode === 0 || mode === 1) {
-        // Classic (0) or Dense Roster (1)
         let curG1 = null;
         let curG2 = null;
         let currentList = null;
@@ -1019,7 +1127,9 @@ function renderApp() {
         });
 
     } else {
-        // Logistics Mode (2: To Camp, 3: To NYC)
+        // ==========================================
+        // VIEW 2 & 3: LOGISTICS (TO CAMP / TO NYC)
+        // ==========================================
         let groupMath = {};
         filtered.forEach(r => {
             let grp = mode === 2 ? r._arrive : r._depart;
@@ -1146,6 +1256,9 @@ def get_data():
     col_hall = find_col_idx(
         headers, ["locality", "hall", "locality/hall", "church"], -1
     )
+    col_district = find_col_idx(
+        headers, ["district", "region", "area", "zone"], -1
+    )
     col_status = find_col_idx(
         headers,
         [
@@ -1193,6 +1306,7 @@ def get_data():
             "col_map": {
                 "name": col_name,
                 "hall": col_hall,
+                "district": col_district,
                 "status": col_status,
             },
         }
