@@ -109,13 +109,6 @@ def parse_transport_state(row, col_drive, col_ride, col_space):
 
 
 def infer_timing(status_val):
-    """
-    Explicit timing inference:
-    - Part-time sat. Night -> To Camp: Saturday | To NYC: Sunday (Lord's Day)
-    - Part-time fri. Night -> To Camp: Friday   | To NYC: Saturday
-    - Day-only / offsite   -> To Camp: Saturday | To NYC: Saturday
-    - Full time            -> To Camp: Friday   | To NYC: Sunday (Lord's Day)
-    """
     status = status_val.lower().strip()
     
     if "sat" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
@@ -276,7 +269,7 @@ HTML_TEMPLATE = """
 
 <div class="sticky-top-panel shadow-sm">
     <div class="container-fluid px-1">
-        <!-- Row 1: Segment Controller (5 distinct views) -->
+        <!-- Row 1: Segment Controller -->
         <div class="btn-group w-100 mb-2 shadow-none" role="group">
             <input type="radio" class="btn-check" name="viewMode" id="vm0" value="0" checked onchange="renderApp()">
             <label class="btn btn-outline-primary btn-segment" for="vm0">Classic</label>
@@ -405,6 +398,25 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
+<!-- Share Link Modal Fallback -->
+<div class="modal fade" id="shareModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title fw-bold">🔗 Share Pre-filtered Link</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="small text-muted mb-2">Anyone opening this link will see your exact view, filters, and groups:</p>
+        <div class="input-group mb-3">
+          <input type="text" id="shareLinkInput" class="form-control form-control-sm" readonly>
+          <button class="btn btn-primary btn-sm fw-bold" onclick="copyFromShareModal()">Copy</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Details Modal -->
 <div class="modal fade" id="detailModal" tabindex="-1">
   <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
@@ -433,7 +445,6 @@ let sortCol = "";
 let sortAscending = true;
 let isInitializedFromHash = false;
 
-// Client-side helper function to locate column index by keyword
 function jsFindColIdx(headerList, keywords, fallback) {
     if (!Array.isArray(keywords)) keywords = [keywords];
     for (let kw of keywords) {
@@ -504,15 +515,14 @@ async function refreshData() {
 }
 
 function parseHashParams() {
-    let hash = window.location.hash.substring(1);
+    let raw = window.location.hash;
+    if (!raw || raw.length <= 1) return {};
+    let queryStr = raw.substring(1);
+    let urlParams = new URLSearchParams(queryStr);
     let params = {};
-    if (!hash) return params;
-    hash.split('&').forEach(part => {
-        let item = part.split('=');
-        if (item.length === 2) {
-            params[decodeURIComponent(item[0])] = decodeURIComponent(item[1]);
-        }
-    });
+    for (let [k, v] of urlParams.entries()) {
+        params[k] = v;
+    }
     return params;
 }
 
@@ -520,38 +530,48 @@ function loadStateFromHash() {
     let params = parseHashParams();
     if (Object.keys(params).length === 0) return;
 
+    // 1. View Mode
     if (params.mode !== undefined) {
         let m = parseInt(params.mode);
-        if (m >= 0 && m <= 4) {
+        if (!isNaN(m) && m >= 0 && m <= 4) {
             let radio = document.getElementById('vm' + m);
             if (radio) radio.checked = true;
         }
     }
 
-    if (params.halls !== undefined) {
-        let hallsList = params.halls.split(',').map(h => h.trim());
-        selectedHalls.clear();
-        hallsList.forEach(h => {
-            if (allHalls.includes(h)) selectedHalls.add(h);
-        });
-        if (selectedHalls.size === 0) selectedHalls = new Set(allHalls);
+    // 2. Halls filter (JSON parsed or pipe delimited)
+    if (params.halls !== undefined && params.halls !== "") {
+        let hallsList = [];
+        try {
+            hallsList = JSON.parse(params.halls);
+        } catch(e) {
+            hallsList = params.halls.split('|').map(decodeURIComponent);
+        }
         
-        let btn = document.getElementById('btnHalls');
-        if (selectedHalls.size === allHalls.length) btn.innerText = "📍 Halls: All";
-        else if (selectedHalls.size === 0) btn.innerText = "📍 Halls: None";
-        else btn.innerText = `📍 Halls: (${selectedHalls.size})`;
+        if (Array.isArray(hallsList) && hallsList.length > 0) {
+            selectedHalls.clear();
+            hallsList.forEach(h => {
+                if (allHalls.includes(h)) selectedHalls.add(h);
+            });
+            if (selectedHalls.size === 0) selectedHalls = new Set(allHalls);
+        }
+        
+        updateHallsButtonText();
     }
 
+    // 3. Transport filter
     if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
         transportFilter = params.trans;
         let shortTitle = transportFilter.replace(" Only", "");
         document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
     }
 
+    // 4. Search query
     if (params.search !== undefined) {
         document.getElementById('searchInput').value = params.search;
     }
 
+    // 5. Settings
     if (params.primary !== undefined && headers.includes(params.primary)) {
         primaryGroupCol = params.primary;
     }
@@ -568,57 +588,110 @@ function loadStateFromHash() {
     populateSettingsDropdowns();
 }
 
-function updateUrlHash() {
+function updateHallsButtonText() {
+    let btn = document.getElementById('btnHalls');
+    if (!btn) return;
+    if (selectedHalls.size === allHalls.length) btn.innerText = "📍 Halls: All";
+    else if (selectedHalls.size === 0) btn.innerText = "📍 Halls: None";
+    else btn.innerText = `📍 Halls: (${selectedHalls.size})`;
+}
+
+function buildCurrentHash() {
     let modeEl = document.querySelector('input[name="viewMode"]:checked');
     let mode = modeEl ? modeEl.value : "0";
     let searchVal = document.getElementById('searchInput').value.trim();
-    let hallsVal = Array.from(selectedHalls).join(',');
 
-    let params = [];
-    params.push("mode=" + mode);
-    if (selectedHalls.size < allHalls.length) {
-        params.push("halls=" + encodeURIComponent(hallsVal));
+    let sp = new URLSearchParams();
+    sp.set("mode", mode);
+
+    if (selectedHalls.size > 0 && selectedHalls.size < allHalls.length) {
+        sp.set("halls", JSON.stringify(Array.from(selectedHalls)));
     }
     if (transportFilter !== "All") {
-        params.push("trans=" + encodeURIComponent(transportFilter));
+        sp.set("trans", transportFilter);
     }
     if (searchVal) {
-        params.push("search=" + encodeURIComponent(searchVal));
+        sp.set("search", searchVal);
     }
     if (primaryGroupCol && primaryGroupCol !== headers[colMap.hall]) {
-        params.push("primary=" + encodeURIComponent(primaryGroupCol));
+        sp.set("primary", primaryGroupCol);
     }
-    if (secondaryGroupCol !== "__NONE__") {
-        params.push("secondary=" + encodeURIComponent(secondaryGroupCol));
+    if (secondaryGroupCol && secondaryGroupCol !== "__NONE__") {
+        sp.set("secondary", secondaryGroupCol);
     }
     if (sortCol && sortCol !== headers[colMap.name]) {
-        params.push("sort=" + encodeURIComponent(sortCol));
+        sp.set("sort", sortCol);
     }
     if (!sortAscending) {
-        params.push("dir=desc");
+        sp.set("dir", "desc");
     }
 
-    let newHash = "#" + params.join("&");
+    return "#" + sp.toString();
+}
+
+function updateUrlHash() {
+    let newHash = buildCurrentHash();
     if (window.location.hash !== newHash) {
         history.replaceState(null, "", newHash);
     }
 }
 
-function copyShareableLink() {
+async function copyShareableLink() {
     updateUrlHash();
     let currentUrl = window.location.href;
-    
-    const textarea = document.createElement("textarea");
-    textarea.value = currentUrl;
-    document.body.appendChild(textarea);
-    textarea.select();
-    try {
-        document.execCommand('copy');
-        showToast("🔗 Shareable link copied to clipboard!");
-    } catch (err) {
-        showToast("⚠️ Could not copy link automatically.");
+
+    // 1. Try Mobile Native Share API if supported
+    if (navigator.share && /mobile|android|iphone|ipad/i.test(navigator.userAgent)) {
+        try {
+            await navigator.share({
+                title: 'Camp Comm Center Dashboard',
+                url: currentUrl
+            });
+            return;
+        } catch (err) {
+            // Fallback to clipboard if user dismissed share sheet
+        }
     }
-    document.body.removeChild(textarea);
+
+    // 2. Fallback to execCommand / input
+    let success = false;
+    let tempInput = document.createElement("textarea");
+    tempInput.style.position = "fixed";
+    tempInput.style.top = "0";
+    tempInput.style.left = "0";
+    tempInput.style.opacity = "0";
+    tempInput.value = currentUrl;
+    document.body.appendChild(tempInput);
+    tempInput.focus();
+    tempInput.select();
+
+    try {
+        success = document.execCommand('copy');
+    } catch (e) {
+        success = false;
+    }
+    document.body.removeChild(tempInput);
+
+    if (success) {
+        showToast("🔗 Pre-filtered link copied to clipboard!");
+    } else {
+        // 3. Fallback: Show Modal with link
+        document.getElementById('shareLinkInput').value = currentUrl;
+        let shareModal = new bootstrap.Modal(document.getElementById('shareModal'));
+        shareModal.show();
+    }
+}
+
+function copyFromShareModal() {
+    let copyText = document.getElementById("shareLinkInput");
+    copyText.select();
+    copyText.setSelectionRange(0, 99999);
+    try {
+        document.execCommand("copy");
+        showToast("🔗 Link copied!");
+    } catch (e) {
+        showToast("Please copy the link directly.");
+    }
 }
 
 function showToast(message) {
@@ -641,6 +714,8 @@ function populateSettingsDropdowns() {
     let selS = document.getElementById('selSecondaryGroup');
     let selSort = document.getElementById('selSortCol');
     let selDir = document.getElementById('selSortDir');
+
+    if (!selP || !selS || !selSort || !selDir) return;
 
     selP.innerHTML = "";
     selS.innerHTML = '<option value="__NONE__">(None / Disabled)</option>';
@@ -676,7 +751,7 @@ function openHallsModal() {
         let item = document.createElement('label');
         item.className = "list-group-item d-flex align-items-center hall-checkbox-item";
         item.innerHTML = `
-            <input class="form-check-input me-2 hall-cb" type="checkbox" value="${h}" ${isChecked ? 'checked' : ''}>
+            <input class="form-check-input me-2 hall-cb" type="checkbox" value="${encodeURIComponent(h)}" ${isChecked ? 'checked' : ''}>
             <span>${h}</span>
         `;
         list.appendChild(item);
@@ -691,12 +766,9 @@ function selectAllHalls(check) {
 function applyHallSelection() {
     selectedHalls.clear();
     document.querySelectorAll('.hall-cb').forEach(cb => {
-        if (cb.checked) selectedHalls.add(cb.value);
+        if (cb.checked) selectedHalls.add(decodeURIComponent(cb.value));
     });
-    let btn = document.getElementById('btnHalls');
-    if (selectedHalls.size === allHalls.length) btn.innerText = "📍 Halls: All";
-    else if (selectedHalls.size === 0) btn.innerText = "📍 Halls: None";
-    else btn.innerText = `📍 Halls: (${selectedHalls.size})`;
+    updateHallsButtonText();
     renderApp();
 }
 
@@ -783,16 +855,7 @@ function renderApp() {
         let localities = Array.from(localitiesSet).sort();
         if (localities.length === 0) localities = ["All Data"];
 
-        // Defined Timing Slots
-        let timingColumns = [
-            { id: "fri_sun", label: "Fri ➔ Sun", arrive: "Friday", depart: "Sunday (Lord's Day)" },
-            { id: "sat_sun", label: "Sat ➔ Sun", arrive: "Saturday", depart: "Sunday (Lord's Day)" },
-            { id: "fri_sat", label: "Fri ➔ Sat", arrive: "Friday", depart: "Saturday" },
-            { id: "sat_sat", label: "Sat ➔ Sat", arrive: "Saturday", depart: "Saturday" },
-            { id: "other", label: "Other/Day", arrive: null, depart: null }
-        ];
-
-        // --- TABLE 1: Attendee Counts by Locality & Timing ---
+        // TABLE 1: Attendee Counts by Locality & Timing
         let t1Counts = {};
         let t1ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
         let t1GrandTotal = 0;
@@ -871,7 +934,7 @@ function renderApp() {
         </div>
         `;
 
-        // --- TABLE 2: Ride Requests Matrix ---
+        // TABLE 2: Ride Requests Matrix
         let t2Counts = {};
         let t2ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
         let t2GrandTotal = 0;
@@ -951,7 +1014,7 @@ function renderApp() {
         </div>
         `;
 
-        // --- TABLE 3: District by Locality Breakdown ---
+        // TABLE 3: District by Locality Breakdown
         let distIdx = jsFindColIdx(headers, ["district", "region", "area", "zone"], -1);
         let distMap = {};
         let totalDistrictAttendees = 0;
