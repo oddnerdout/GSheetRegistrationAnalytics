@@ -109,27 +109,39 @@ def parse_transport_state(row, col_drive, col_ride, col_space):
 
 
 def infer_timing(status_val):
-    status = status_val.lower()
-    if (
-        "full time" in status
-        or "full-time" in status
-        or "all weekend" in status
-    ):
-        return "Friday", "Sunday (Lord's Day)"
-    elif "friday" in status and "overnight" in status:
-        return "Friday", "Saturday"
-    elif "saturday" in status and "overnight" in status:
+    """
+    Explicit timing inference:
+    - Part-time sat. Night -> To Camp: Saturday | To NYC: Sunday (Lord's Day)
+    - Part-time fri. Night -> To Camp: Friday   | To NYC: Saturday
+    - Day-only / offsite   -> To Camp: Saturday | To NYC: Saturday
+    - Full time            -> To Camp: Friday   | To NYC: Sunday (Lord's Day)
+    """
+    status = status_val.lower().strip()
+    
+    # 1. Part-time (Sat. Night) -> Saturday arrival, Sunday return
+    if "sat" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
         return "Saturday", "Sunday (Lord's Day)"
-    elif "friday" in status:
-        return "Friday", "Friday (Day Only)"
-    elif "saturday" in status and (
-        "day" in status or "offsite" in status or "day-only" in status
-    ):
+        
+    # 2. Part-time (Fri. Night) -> Friday arrival, Saturday return
+    elif "fri" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
+        return "Friday", "Saturday"
+        
+    # 3. Day-only / Offsite -> Saturday arrival, Saturday return
+    elif "day-only" in status or "day only" in status or "offsite" in status or "1 day" in status or "(1 day)" in status:
         return "Saturday", "Saturday"
-    elif "saturday" in status:
-        return "Saturday", "Saturday (Day Only)"
-    elif "sunday" in status or "lord's day" in status:
+        
+    # 4. Full time / All weekend -> Friday arrival, Sunday return
+    elif "full time" in status or "full-time" in status or "all weekend" in status or "full" in status:
+        return "Friday", "Sunday (Lord's Day)"
+        
+    # 5. Fallbacks for specific day mentions
+    elif "friday" in status or "fri" in status:
+        return "Friday", "Friday (Day Only)"
+    elif "sunday" in status or "lord's day" in status or "lords day" in status:
         return "Sunday (Lord's Day)", "Sunday (Lord's Day)"
+    elif "saturday" in status or "sat" in status:
+        return "Saturday", "Saturday"
+        
     return "Unknown Timing", "Unknown Timing"
 
 
@@ -367,7 +379,7 @@ async function refreshData() {
             return;
         }
 
-        // Initialize Column Selectors for Grouping & Sorting
+        // Initialize Halls
         let halls = new Set();
         rawData.forEach(r => {
             let h = (r.data[colMap.hall] || "").trim();
@@ -515,7 +527,21 @@ function renderApp() {
         }
     });
 
-    // 3. RENDERING
+    // 3. PRECOMPUTE COUNTS PER GROUP
+    let primaryCounts = {};
+    let secondaryCounts = {};
+    filtered.forEach(r => {
+        let valG1 = pIdx >= 0 ? (r.data[pIdx] || "(Empty)").trim() : "All Attendees";
+        let valG2 = sIdx >= 0 ? (r.data[sIdx] || "").trim() : "";
+        
+        primaryCounts[valG1] = (primaryCounts[valG1] || 0) + 1;
+        if (valG2) {
+            let compositeKey = valG1 + "|||" + valG2;
+            secondaryCounts[compositeKey] = (secondaryCounts[compositeKey] || 0) + 1;
+        }
+    });
+
+    // 4. RENDERING
     let container = document.getElementById('contentList');
     container.innerHTML = "";
 
@@ -537,9 +563,14 @@ function renderApp() {
             if (valG1 !== curG1) {
                 curG1 = valG1;
                 curG2 = null;
+                let g1Total = primaryCounts[valG1] || 0;
+
                 let h1 = document.createElement('div');
-                h1.className = "card-header-g1 shadow-sm";
-                h1.innerText = `📍 ${primaryGroupCol}: ${valG1}`;
+                h1.className = "card-header-g1 shadow-sm d-flex justify-content-between align-items-center";
+                h1.innerHTML = `
+                    <span>📍 ${primaryGroupCol}: ${valG1}</span>
+                    <span class="badge bg-secondary rounded-pill">${g1Total}</span>
+                `;
                 container.appendChild(h1);
 
                 currentList = document.createElement('div');
@@ -549,9 +580,14 @@ function renderApp() {
 
             if (sIdx >= 0 && valG2 && valG2 !== curG2) {
                 curG2 = valG2;
+                let g2Total = secondaryCounts[valG1 + "|||" + valG2] || 0;
+
                 let h2 = document.createElement('div');
-                h2.className = "card-header-g2";
-                h2.innerText = `  ⛺ ${secondaryGroupCol}: ${valG2}`;
+                h2.className = "card-header-g2 d-flex justify-content-between align-items-center";
+                h2.innerHTML = `
+                    <span>⛺ ${secondaryGroupCol}: ${valG2}</span>
+                    <span class="badge bg-light text-dark border">${g2Total}</span>
+                `;
                 currentList.appendChild(h2);
             }
 
@@ -602,13 +638,19 @@ function renderApp() {
         let groupMath = {};
         filtered.forEach(r => {
             let grp = mode === 2 ? r._arrive : r._depart;
-            if (!groupMath[grp]) groupMath[grp] = { needs: 0, seats: 0, rows: [] };
+            if (!groupMath[grp]) groupMath[grp] = { total: 0, needs: 0, seats: 0, rows: [] };
+            groupMath[grp].total++;
             if (r._tstate.is_ride_req) groupMath[grp].needs++;
             if (r._tstate.is_driver) groupMath[grp].seats += r._tstate.seat_count;
             groupMath[grp].rows.push(r);
         });
 
-        Object.keys(groupMath).forEach(grp => {
+        // Ensure chronological display order
+        let sortedGroups = Object.keys(groupMath).sort((a, b) => {
+            return (timeWeights[a] || 99) - (timeWeights[b] || 99);
+        });
+
+        sortedGroups.forEach(grp => {
             let stats = groupMath[grp];
             let deficit = stats.needs - stats.seats;
             let prefix = mode === 2 ? "🚐 To Camp:" : "🚐 To NYC:";
@@ -630,7 +672,7 @@ function renderApp() {
             h.className = headerClass + " d-flex justify-content-between align-items-center";
             h.innerHTML = `
                 <div>
-                    <div><strong>🕒 ${prefix} ${grp}</strong></div>
+                    <div><strong>🕒 ${prefix} ${grp}</strong> <span class="badge bg-dark bg-opacity-50 ms-1">${stats.total} attendees</span></div>
                     <small>Needs: <strong>${stats.needs}</strong> | Seats: <strong>${stats.seats}</strong></small>
                 </div>
                 <div>${badgeHtml}</div>
@@ -712,11 +754,12 @@ def get_data():
     col_status = find_col_idx(
         headers,
         [
+            "camp stay",
+            "stay type",
             "status",
             "registration type",
             "attending",
             "full time",
-            "camp stay",
             "registration",
         ],
         -1,
