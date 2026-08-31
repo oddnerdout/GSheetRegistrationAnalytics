@@ -174,7 +174,7 @@ HTML_TEMPLATE = """
         }
         .card-header-g1 { 
             font-weight: bold; 
-            padding: 7px 12px; 
+            padding: 8px 12px; 
             margin-top: 12px; 
             border-radius: 6px 6px 0 0; 
             font-size: 0.95rem;
@@ -183,7 +183,7 @@ HTML_TEMPLATE = """
         }
         .card-header-g2 { 
             font-weight: 600; 
-            padding: 5px 12px; 
+            padding: 6px 12px; 
             border-bottom: 1px solid #e5e5ea;
             font-size: 0.85rem;
             background-color: #f4f6f9;
@@ -199,9 +199,50 @@ HTML_TEMPLATE = """
             color: #d73a49 !important;
             border: 1px solid #f8b4b4;
         }
-        .badge-req { color: #d73a49; font-weight: 700; font-size: 0.82rem; }
-        .badge-driver { color: #28a745; font-weight: 700; font-size: 0.82rem; }
-        .badge-offer { color: #007aff; font-weight: 700; font-size: 0.82rem; }
+        .badge-req { 
+            background-color: #ffebee;
+            color: #d73a49; 
+            font-weight: 700; 
+            font-size: 0.78rem; 
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #ffcdd2;
+            white-space: nowrap;
+        }
+        .badge-driver { 
+            background-color: #e8f5e9;
+            color: #28a745; 
+            font-weight: 700; 
+            font-size: 0.78rem; 
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #c8e6c9;
+            white-space: nowrap;
+        }
+        .badge-offer { 
+            background-color: #e3f2fd;
+            color: #007aff; 
+            font-weight: 700; 
+            font-size: 0.78rem; 
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #bbdefb;
+            white-space: nowrap;
+        }
+        .badge-hall-tag {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #3a3a3c;
+            background-color: #e5e5ea;
+            padding: 2px 6px;
+            border-radius: 4px;
+            max-width: 100%;
+            display: inline-block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            vertical-align: middle;
+        }
         .list-group-item { 
             cursor: pointer; 
             transition: background-color 0.15s;
@@ -602,8 +643,8 @@ function renderApp() {
                 // Dense Mode
                 item.className += " dense-row d-flex justify-content-between align-items-center";
                 item.innerHTML = `
-                    <span class="fw-bold fs-6">${name}</span>
-                    <small class="text-muted text-end text-truncate ms-2">${status}</small>
+                    <span class="fw-bold fs-6 text-truncate me-2">${name}</span>
+                    <small class="text-muted text-end text-truncate">${status}</small>
                 `;
             } else {
                 // Classic Mode
@@ -622,9 +663,9 @@ function renderApp() {
 
                 item.innerHTML = `
                     <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <div class="fw-bold">${name}</div>
-                            <small class="text-muted">${statusText} ${subText}</small>
+                        <div class="pe-2 text-truncate">
+                            <div class="fw-bold text-truncate">${name}</div>
+                            <small class="text-muted text-truncate d-block">${statusText} ${subText}</small>
                         </div>
                         <span class="text-muted">&rsaquo;</span>
                     </div>
@@ -684,23 +725,34 @@ function renderApp() {
 
             stats.rows.forEach(r => {
                 let item = document.createElement('a');
-                item.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center";
+                item.className = "list-group-item list-group-item-action";
                 item.onclick = () => showDetail(r.data);
 
                 let badge = "";
-                if (r._tstate.is_driver) badge = `<span class="badge-driver">Driver (${r._tstate.space_val})</span>`;
+                if (r._tstate.is_driver) badge = `<span class="badge-driver">🚗 Driver (${r._tstate.space_val})</span>`;
                 else if (r._tstate.has_valid_space && r._tstate.explicit_driver_no) badge = `<span class="badge-offer">Offer (${r._tstate.space_val})</span>`;
-                else if (r._tstate.is_ride_req) badge = `<span class="badge-req">Need Ride</span>`;
+                else if (r._tstate.is_ride_req) badge = `<span class="badge-req">🙋 Need Ride</span>`;
 
                 let name = r.data[colMap.name] || "(Unnamed)";
                 let status = colMap.status >= 0 ? (r.data[colMap.status] || "") : "";
+                let hall = colMap.hall >= 0 ? (r.data[colMap.hall] || "").trim() : "";
+
+                let hallTag = hall ? `<span class="badge-hall-tag me-1" title="${hall}">📍 ${hall}</span>` : "";
+                let statusTag = status ? `<small class="text-muted">${status}</small>` : "";
 
                 item.innerHTML = `
-                    <div>
-                        <div class="fw-bold">${name}</div>
-                        <small class="text-muted">${status}</small>
+                    <div class="d-flex justify-content-between align-items-start gap-2">
+                        <div style="min-width: 0; flex: 1;">
+                            <div class="fw-bold text-truncate mb-1" style="font-size: 0.95rem;">${name}</div>
+                            <div class="d-flex flex-wrap align-items-center gap-1">
+                                ${hallTag}
+                                ${statusTag}
+                            </div>
+                        </div>
+                        <div class="flex-shrink-0 text-end pt-1">
+                            ${badge}
+                        </div>
                     </div>
-                    <div>${badge}</div>
                 `;
                 list.appendChild(item);
             });
