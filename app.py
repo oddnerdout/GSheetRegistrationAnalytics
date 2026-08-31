@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # Securely retrieve Sheet ID from Environment Variables
 # Set a default fallback for local development if needed
-NY")
+
 
 def fetch_sheet_data():
     """Downloads and parses the Google Sheet from the hidden SHEET_ID."""
