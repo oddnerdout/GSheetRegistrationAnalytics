@@ -652,11 +652,18 @@ function renderApp() {
                 let tState = r._tstate;
                 if (tState.is_driver) {
                     subParts.push("🚗 Driver");
-                    if (tState.has_valid_space) subParts.push("💺 Seats: " + tState.space_val);
+                    if (tState.space_val && tState.space_val.trim()) {
+                        subParts.push("💺 Seats: " + tState.space_val.trim());
+                    }
                 } else if (tState.has_valid_space && tState.explicit_driver_no) {
-                    subParts.push("💺 Offered Seats: " + tState.space_val);
+                    subParts.push("💺 Offered Seats: " + tState.space_val.trim());
+                } else if (tState.space_val && tState.space_val.trim() && !tState.explicit_driver_no) {
+                    subParts.push("💺 Space: " + tState.space_val.trim());
                 }
-                if (tState.is_ride_req) subParts.push("🙋 Ride Req");
+                
+                if (tState.is_ride_req) {
+                    subParts.push("🙋 Ride Req");
+                }
 
                 let subText = subParts.length ? "  •  " + subParts.join("  •  ") : "";
                 let statusText = status ? `[${status}]` : "";
@@ -729,7 +736,7 @@ function renderApp() {
                 item.onclick = () => showDetail(r.data);
 
                 let badge = "";
-                if (r._tstate.is_driver) badge = `<span class="badge-driver">🚗 Driver (${r._tstate.space_val})</span>`;
+                if (r._tstate.is_driver) badge = `<span class="badge-driver">🚗 Driver (${r._tstate.space_val || 'Yes'})</span>`;
                 else if (r._tstate.has_valid_space && r._tstate.explicit_driver_no) badge = `<span class="badge-offer">Offer (${r._tstate.space_val})</span>`;
                 else if (r._tstate.is_ride_req) badge = `<span class="badge-req">🙋 Need Ride</span>`;
 
