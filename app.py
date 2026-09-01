@@ -2,16 +2,25 @@ import csv
 import io
 import os
 import re
+import time
+import threading
 import urllib.request
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, make_response
 
 app = Flask(__name__)
 
-# Retrieve Sheet ID from Environment Variables
+# Configuration
 SHEET_ID = os.environ.get("SHEET_ID", "").strip()
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "60"))
+
+# In-Memory Cache State & Concurrency Lock
+cache_lock = threading.Lock()
+cached_payload = None
+cache_timestamp = 0
+last_good_payload = None
 
 
-def fetch_sheet_data():
+def fetch_sheet_data_from_google():
     """Downloads and parses the Google Sheet from the hidden SHEET_ID."""
     if not SHEET_ID:
         print("[Error] SHEET_ID environment variable is not set.")
@@ -26,11 +35,13 @@ def fetch_sheet_data():
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/115.0.0.0 Safari/537.36"
-                )
+                ),
+                "Accept-Encoding": "gzip, deflate",
             },
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            csv_string_data = response.read().decode("utf-8")
+        # 8 second timeout to avoid worker thread exhaustion
+        with urllib.request.urlopen(req, timeout=8) as response:
+            csv_string_data = response.read().decode("utf-8", errors="replace")
 
         csv_reader = csv.reader(io.StringIO(csv_string_data))
         raw_rows = list(csv_reader)
@@ -44,7 +55,7 @@ def fetch_sheet_data():
 
         return headers, cleaned_rows
     except Exception as e:
-        print(f"[Error] Sheet fetch failed: {e}")
+        print(f"[Error] Google Sheet fetch failed: {e}")
         return [], []
 
 
@@ -127,6 +138,85 @@ def infer_timing(status_val):
         return "Saturday", "Saturday"
         
     return "Unknown Timing", "Unknown Timing"
+
+
+def generate_fresh_payload():
+    """Fetches and transforms the Google Sheet into the API response format."""
+    headers, rows = fetch_sheet_data_from_google()
+    if not headers and not rows:
+        return None
+
+    col_name = find_col_idx(headers, ["full name", "name", "attendee", "participant"], 0)
+    col_hall = find_col_idx(headers, ["locality", "hall", "locality/hall", "church"], -1)
+    col_district = find_col_idx(headers, ["district", "region", "area", "zone"], -1)
+    col_status = find_col_idx(
+        headers,
+        ["camp stay", "stay type", "status", "registration type", "attending", "full time", "registration"],
+        -1,
+    )
+    col_ride = find_col_idx(headers, ["need a ride", "ride request", "need ride", "passenger"], -1)
+    col_drive = find_col_idx(headers, ["give rides", "driver", "can you drive", "can you give"], -1)
+    col_space = find_col_idx(headers, ["space", "capacity", "seats", "how much space", "vehicle"], -1)
+
+    processed_rows = []
+    for r in rows:
+        tstate = parse_transport_state(r, col_drive, col_ride, col_space)
+        status_val = r[col_status] if 0 <= col_status < len(r) else ""
+        arrive, depart = infer_timing(status_val)
+
+        processed_rows.append(
+            {
+                "data": r,
+                "_tstate": tstate,
+                "_arrive": arrive,
+                "_depart": depart,
+            }
+        )
+
+    return {
+        "headers": headers,
+        "rows": processed_rows,
+        "col_map": {
+            "name": col_name,
+            "hall": col_hall,
+            "district": col_district,
+            "status": col_status,
+        },
+        "cached_at": time.time(),
+    }
+
+
+def get_cached_or_fresh_data(force_refresh=False):
+    """
+    Thread-safe Cache accessor.
+    Prevents cache stampedes and serves stale data if Google Sheets fails.
+    """
+    global cached_payload, cache_timestamp, last_good_payload
+    now = time.time()
+
+    # Fast Read Path (No lock needed for read if fresh)
+    if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
+        return cached_payload, False
+
+    # Cache Expired or Forced Refresh: Synchronize with Lock
+    with cache_lock:
+        # Re-check under lock (Double-checked locking pattern)
+        now = time.time()
+        if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
+            return cached_payload, False
+
+        fresh = generate_fresh_payload()
+        if fresh is not None:
+            cached_payload = fresh
+            cache_timestamp = now
+            last_good_payload = fresh
+            return cached_payload, True
+        elif last_good_payload is not None:
+            # Fallback to stale data if Google Sheets failed
+            print("[Warning] Serving stale cache due to upstream fetch failure.")
+            return last_good_payload, False
+        else:
+            return {"headers": [], "rows": [], "col_map": {}}, False
 
 
 HTML_TEMPLATE = """
@@ -263,6 +353,13 @@ HTML_TEMPLATE = """
             border-top-left-radius: 8px;
             border-top-right-radius: 8px;
         }
+        .spin {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
@@ -319,7 +416,7 @@ HTML_TEMPLATE = """
                 </button>
             </div>
             <div class="col-2">
-                <button class="btn btn-success btn-sm w-100 fw-bold" onclick="refreshData()" title="Refresh Sheet Data">
+                <button id="btnRefresh" class="btn btn-success btn-sm w-100 fw-bold" onclick="refreshData(true)" title="Force Refresh Sheet Data">
                     🔄
                 </button>
             </div>
@@ -467,11 +564,19 @@ function abbreviateLocality(name) {
     return words.map(w => w[0]).join("").toUpperCase();
 }
 
-async function refreshData() {
+async function refreshData(force = false) {
     let alertBox = document.getElementById('statusAlert');
+    let btnRefresh = document.getElementById('btnRefresh');
     alertBox.classList.add('d-none');
+    
+    if (btnRefresh) {
+        btnRefresh.classList.add('disabled');
+        btnRefresh.innerHTML = '<span class="d-inline-block spin">🔄</span>';
+    }
+
     try {
-        let res = await fetch('/api/data');
+        let endpoint = force ? '/api/data?refresh=1' : '/api/data';
+        let res = await fetch(endpoint);
         let json = await res.json();
         rawData = json.rows || [];
         headers = json.headers || [];
@@ -491,7 +596,10 @@ async function refreshData() {
         });
         allHalls = Array.from(halls).sort();
         if (allHalls.length === 0) allHalls = ["All Data"];
-        selectedHalls = new Set(allHalls);
+        
+        if (selectedHalls.size === 0) {
+            selectedHalls = new Set(allHalls);
+        }
 
         primaryGroupCol = headers[colMap.hall] || headers[0] || "";
         sortCol = headers[colMap.name] || headers[0] || "";
@@ -507,10 +615,16 @@ async function refreshData() {
         }
 
         renderApp();
+        if (force) showToast("✅ Data synchronized with Google Sheet.");
     } catch (err) {
         console.error(err);
-        alertBox.innerText = "Error loading data. Check Render service logs.";
+        alertBox.innerText = "Error loading data. Check server logs.";
         alertBox.classList.remove('d-none');
+    } finally {
+        if (btnRefresh) {
+            btnRefresh.classList.remove('disabled');
+            btnRefresh.innerHTML = '🔄';
+        }
     }
 }
 
@@ -530,7 +644,6 @@ function loadStateFromHash() {
     let params = parseHashParams();
     if (Object.keys(params).length === 0) return;
 
-    // 1. View Mode
     if (params.mode !== undefined) {
         let m = parseInt(params.mode);
         if (!isNaN(m) && m >= 0 && m <= 4) {
@@ -539,7 +652,6 @@ function loadStateFromHash() {
         }
     }
 
-    // 2. Halls filter (JSON parsed or pipe delimited)
     if (params.halls !== undefined && params.halls !== "") {
         let hallsList = [];
         try {
@@ -555,23 +667,19 @@ function loadStateFromHash() {
             });
             if (selectedHalls.size === 0) selectedHalls = new Set(allHalls);
         }
-        
         updateHallsButtonText();
     }
 
-    // 3. Transport filter
     if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
         transportFilter = params.trans;
         let shortTitle = transportFilter.replace(" Only", "");
         document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
     }
 
-    // 4. Search query
     if (params.search !== undefined) {
         document.getElementById('searchInput').value = params.search;
     }
 
-    // 5. Settings
     if (params.primary !== undefined && headers.includes(params.primary)) {
         primaryGroupCol = params.primary;
     }
@@ -640,7 +748,6 @@ async function copyShareableLink() {
     updateUrlHash();
     let currentUrl = window.location.href;
 
-    // 1. Try Mobile Native Share API if supported
     if (navigator.share && /mobile|android|iphone|ipad/i.test(navigator.userAgent)) {
         try {
             await navigator.share({
@@ -648,12 +755,9 @@ async function copyShareableLink() {
                 url: currentUrl
             });
             return;
-        } catch (err) {
-            // Fallback to clipboard if user dismissed share sheet
-        }
+        } catch (err) {}
     }
 
-    // 2. Fallback to execCommand / input
     let success = false;
     let tempInput = document.createElement("textarea");
     tempInput.style.position = "fixed";
@@ -675,7 +779,6 @@ async function copyShareableLink() {
     if (success) {
         showToast("🔗 Pre-filtered link copied to clipboard!");
     } else {
-        // 3. Fallback: Show Modal with link
         document.getElementById('shareLinkInput').value = currentUrl;
         let shareModal = new bootstrap.Modal(document.getElementById('shareModal'));
         shareModal.show();
@@ -843,9 +946,7 @@ function renderApp() {
         return;
     }
 
-    // ==========================================
     // VIEW 4: AT-A-GLANCE MATRIX ANALYTICS
-    // ==========================================
     if (mode === 4) {
         let localitiesSet = new Set();
         filtered.forEach(r => {
@@ -855,7 +956,6 @@ function renderApp() {
         let localities = Array.from(localitiesSet).sort();
         if (localities.length === 0) localities = ["All Data"];
 
-        // TABLE 1: Attendee Counts by Locality & Timing
         let t1Counts = {};
         let t1ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
         let t1GrandTotal = 0;
@@ -934,7 +1034,6 @@ function renderApp() {
         </div>
         `;
 
-        // TABLE 2: Ride Requests Matrix
         let t2Counts = {};
         let t2ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
         let t2GrandTotal = 0;
@@ -1014,7 +1113,6 @@ function renderApp() {
         </div>
         `;
 
-        // TABLE 3: District by Locality Breakdown
         let distIdx = jsFindColIdx(headers, ["district", "region", "area", "zone"], -1);
         let distMap = {};
         let totalDistrictAttendees = 0;
@@ -1086,9 +1184,7 @@ function renderApp() {
         return;
     }
 
-    // ==========================================
     // VIEW 0 & 1: CLASSIC & ROSTER VIEWS
-    // ==========================================
     if (mode === 0 || mode === 1) {
         let curG1 = null;
         let curG2 = null;
@@ -1190,9 +1286,7 @@ function renderApp() {
         });
 
     } else {
-        // ==========================================
         // VIEW 2 & 3: LOGISTICS (TO CAMP / TO NYC)
-        // ==========================================
         let groupMath = {};
         filtered.forEach(r => {
             let grp = mode === 2 ? r._arrive : r._depart;
@@ -1296,7 +1390,7 @@ function showDetail(row) {
     new bootstrap.Modal(document.getElementById('detailModal')).show();
 }
 
-// Initial data load on startup
+// Initial data load
 refreshData();
 </script>
 </body>
@@ -1306,74 +1400,22 @@ refreshData();
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    resp = make_response(render_template_string(HTML_TEMPLATE))
+    # Cache the HTML shell on browser/edge for fast initial loads
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
 
 
 @app.route("/api/data")
 def get_data():
-    headers, rows = fetch_sheet_data()
+    # Allow explicit manual refresh with ?refresh=1
+    force_refresh = request.args.get("refresh") in ["1", "true", "yes"]
+    data, was_fresh = get_cached_or_fresh_data(force_refresh=force_refresh)
 
-    col_name = find_col_idx(
-        headers, ["full name", "name", "attendee", "participant"], 0
-    )
-    col_hall = find_col_idx(
-        headers, ["locality", "hall", "locality/hall", "church"], -1
-    )
-    col_district = find_col_idx(
-        headers, ["district", "region", "area", "zone"], -1
-    )
-    col_status = find_col_idx(
-        headers,
-        [
-            "camp stay",
-            "stay type",
-            "status",
-            "registration type",
-            "attending",
-            "full time",
-            "registration",
-        ],
-        -1,
-    )
-    col_ride = find_col_idx(
-        headers, ["need a ride", "ride request", "need ride", "passenger"], -1
-    )
-    col_drive = find_col_idx(
-        headers, ["give rides", "driver", "can you drive", "can you give"], -1
-    )
-    col_space = find_col_idx(
-        headers,
-        ["space", "capacity", "seats", "how much space", "vehicle"],
-        -1,
-    )
-
-    processed_rows = []
-    for r in rows:
-        tstate = parse_transport_state(r, col_drive, col_ride, col_space)
-        status_val = r[col_status] if 0 <= col_status < len(r) else ""
-        arrive, depart = infer_timing(status_val)
-
-        processed_rows.append(
-            {
-                "data": r,
-                "_tstate": tstate,
-                "_arrive": arrive,
-                "_depart": depart,
-            }
-        )
-
-    return jsonify(
-        {
-            "headers": headers,
-            "rows": processed_rows,
-            "col_map": {
-                "name": col_name,
-                "hall": col_hall,
-                "district": col_district,
-                "status": col_status,
-            },
-        }
-    )
+    resp = make_response(jsonify(data))
+    # Direct browser/proxies to cache the JSON payload for 30 seconds
+    resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=60"
+    return resp
 
 
 if __name__ == "__main__":
