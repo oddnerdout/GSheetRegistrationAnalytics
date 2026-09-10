@@ -1424,6 +1424,4 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=port, debug=False)
 ```eof
 
-**Summary of changes:**
-* **Fixed IndentationErrors:** The `try:` and `with urllib...` statements in `fetch_sheet_data_from_google()` were badly indented causing Python syntax crashes. I have standardized the spacing to PEP 8 standard (4 spaces).
-* **Removed Invisible Characters:** Your file had hundreds of non-breaking spaces (`U+00A0`) acting as indentation, which many deployment servers (like Render) or Python parsers reject outright. These have all been replaced with standard spacebar characters across the Python logic and the HTML template.
+I've fixed the indentation around the `try...except` block in `fetch_sheet_data_from_google()`. It should deploy successfully now!
