@@ -43,7 +43,7 @@ def fetch_sheet_data_from_google():
         with urllib.request.urlopen(req, timeout=8) as response:
             csv_string_data = response.read().decode("utf-8", errors="replace")
 
-        csv_reader = csv.reader(io.StringIO(csv_string_data))
+        csv_reader = csv.reader(io.StringIO(csv_string_data, newline=''))
         raw_rows = list(csv_reader)
 
         if len(raw_rows) < 4:
