@@ -27,7 +27,7 @@ def fetch_sheet_data_from_google():
         return [], []
 
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-    try:
+try:
         req = urllib.request.Request(
             url,
             headers={
@@ -35,17 +35,18 @@ def fetch_sheet_data_from_google():
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/115.0.0.0 Safari/537.36"
-                ),
-                "Accept-Encoding": "gzip, deflate",
+                )
+                # Removed "Accept-Encoding": "gzip, deflate" so we receive plain text
             },
         )
         # 8 second timeout to avoid worker thread exhaustion
         with urllib.request.urlopen(req, timeout=8) as response:
             csv_string_data = response.read().decode("utf-8", errors="replace")
 
+        # newline='' ensures multi-line cells aren't counted as multiple rows
         csv_reader = csv.reader(io.StringIO(csv_string_data, newline=''))
         raw_rows = list(csv_reader)
-
+    
         if len(raw_rows) < 4:
             return [], []
 
