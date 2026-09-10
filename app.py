@@ -643,8 +643,8 @@ function parseHashParams() {
 
 function loadStateFromHash() {
     let params = parseHashParams();
-    if (Object.keys(params).length === 0) return;
 
+    // Mode handling
     if (params.mode !== undefined) {
         let m = parseInt(params.mode);
         if (!isNaN(m) && m >= 0 && m <= 4) {
@@ -653,6 +653,7 @@ function loadStateFromHash() {
         }
     }
 
+    // Halls handling
     if (params.halls !== undefined && params.halls !== "") {
         let hallsList = [];
         try {
@@ -668,19 +669,24 @@ function loadStateFromHash() {
             });
             if (selectedHalls.size === 0) selectedHalls = new Set(allHalls);
         }
-        updateHallsButtonText();
+    } else {
+        selectedHalls = new Set(allHalls);
     }
+    updateHallsButtonText();
 
+    // Transport handling
     if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
         transportFilter = params.trans;
-        let shortTitle = transportFilter.replace(" Only", "");
-        document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
+    } else {
+        transportFilter = "All";
     }
+    let shortTitle = transportFilter.replace(" Only", "");
+    document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
 
-    if (params.search !== undefined) {
-        document.getElementById('searchInput').value = params.search;
-    }
+    // Search input
+    document.getElementById('searchInput').value = params.search !== undefined ? params.search : "";
 
+    // Grouping & Sorting
     if (params.primary !== undefined && headers.includes(params.primary)) {
         primaryGroupCol = params.primary;
     }
@@ -696,6 +702,12 @@ function loadStateFromHash() {
 
     populateSettingsDropdowns();
 }
+
+// React whenever a user pastes a new URL with a different hash into Chrome
+window.addEventListener('hashchange', () => {
+    loadStateFromHash();
+    renderApp();
+});
 
 function updateHallsButtonText() {
     let btn = document.getElementById('btnHalls');
