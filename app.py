@@ -7,6 +7,57 @@ import threading
 import urllib.request
 from flask import Flask, jsonify, render_template_string, request, make_response
 
+import queue
+import json
+
+# List to hold event queues for connected clients
+app_subscribers = []
+
+def notify_clients(event_type, payload=None):
+    """Broadcasts a event to all active SSE client streams."""
+    dead_subscribers = []
+    for q in list(app_subscribers):
+        try:
+            q.put_nowait({"event": event_type, "data": payload or {}})
+        except Exception:
+            dead_subscribers.append(q)
+    for q in dead_subscribers:
+        if q in app_subscribers:
+            app_subscribers.remove(q)
+
+@app.route("/api/events")
+def stream_events():
+    """SSE endpoint for clients to listen for real-time updates."""
+    def event_stream():
+        client_queue = queue.Queue(maxsize=10)
+        app_subscribers.append(client_queue)
+        try:
+            while True:
+                # Wait for a broadcast event
+                msg = client_queue.get(timeout=30)
+                yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'])}\n\n"
+        except queue.Empty:
+            # Send keep-alive comment to keep connection alive if needed
+            yield ": keep-alive\n\n"
+        except GeneratorExit:
+            if client_queue in app_subscribers:
+                app_subscribers.remove(client_queue)
+
+    return app.response_class(event_stream(), mimetype="text/event-stream")
+
+@app.route("/api/data")
+def get_data():
+    force_refresh = request.args.get("refresh") in ["1", "true", "yes"]
+    data, was_fresh = get_cached_or_fresh_data(force_refresh=force_refresh)
+
+    # If a user explicitly forced a refresh and fresh data was loaded, notify all other clients
+    if force_refresh and was_fresh:
+        notify_clients("data_updated", {"timestamp": data.get("cached_at")})
+
+    resp = make_response(jsonify(data))
+    resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=60"
+    return resp
+
 app = Flask(__name__)
 
 # Configuration
@@ -1409,7 +1460,28 @@ function showDetail(row) {
     });
     new bootstrap.Modal(document.getElementById('detailModal')).show();
 }
+// Connect to server push notifications using native Server-Sent Events
+function initRealtimeSync() {
+    if (!window.EventSource) return;
 
+    const eventSource = new EventSource('/api/events');
+
+    eventSource.addEventListener('data_updated', (e) => {
+        // Fetch the newly updated data quietly without forcing upstream fetch again
+        refreshData(false);
+        showToast("🔔 Sheet data was updated by another user.");
+    });
+
+    eventSource.onerror = (err) => {
+        // SSE automatically attempts reconnects; close if tab is hidden to save resources
+        if (document.hidden) {
+            eventSource.close();
+        }
+    };
+}
+
+// Initialize on page load
+initRealtimeSync();
 // Initial data load
 refreshData();
 </script>
