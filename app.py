@@ -1495,17 +1495,6 @@ def index():
     return resp
 
 
-@app.route("/api/data")
-def get_data():
-    # Allow explicit manual refresh with ?refresh=1
-    force_refresh = request.args.get("refresh") in ["1", "true", "yes"]
-    data, was_fresh = get_cached_or_fresh_data(force_refresh=force_refresh)
-
-    resp = make_response(jsonify(data))
-    # Direct browser/proxies to cache the JSON payload for 30 seconds
-    resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=60"
-    return resp
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
