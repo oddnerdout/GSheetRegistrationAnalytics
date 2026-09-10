@@ -217,7 +217,7 @@ with cache_lock:
         return {"headers": [], "rows": [], "col_map": {}}, False
 
 
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 
         <input type="radio" class="btn-check" name="viewMode" id="vm1" value="1" onchange="renderApp()">
         <label class="btn btn-outline-primary btn-segment" for="vm1">Roster</label>
