@@ -641,10 +641,13 @@ function parseHashParams() {
     return params;
 }
 
+// Global flag to prevent internal hash updates from triggering hashchange reloading
+let isUpdatingHashInternally = false;
+
 function loadStateFromHash() {
     let params = parseHashParams();
 
-    // Mode handling
+    // Mode: update ONLY if explicitly present in hash
     if (params.mode !== undefined) {
         let m = parseInt(params.mode);
         if (!isNaN(m) && m >= 0 && m <= 4) {
@@ -653,7 +656,7 @@ function loadStateFromHash() {
         }
     }
 
-    // Halls handling
+    // Halls: update ONLY if explicitly present in hash
     if (params.halls !== undefined && params.halls !== "") {
         let hallsList = [];
         try {
@@ -667,24 +670,21 @@ function loadStateFromHash() {
             hallsList.forEach(h => {
                 if (allHalls.includes(h)) selectedHalls.add(h);
             });
-            if (selectedHalls.size === 0) selectedHalls = new Set(allHalls);
         }
-    } else {
-        selectedHalls = new Set(allHalls);
+        updateHallsButtonText();
     }
-    updateHallsButtonText();
 
-    // Transport handling
+    // Transport: update ONLY if explicitly present in hash
     if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
         transportFilter = params.trans;
-    } else {
-        transportFilter = "All";
+        let shortTitle = transportFilter.replace(" Only", "");
+        document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
     }
-    let shortTitle = transportFilter.replace(" Only", "");
-    document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
 
     // Search input
-    document.getElementById('searchInput').value = params.search !== undefined ? params.search : "";
+    if (params.search !== undefined) {
+        document.getElementById('searchInput').value = params.search;
+    }
 
     // Grouping & Sorting
     if (params.primary !== undefined && headers.includes(params.primary)) {
@@ -703,11 +703,23 @@ function loadStateFromHash() {
     populateSettingsDropdowns();
 }
 
-// React whenever a user pastes a new URL with a different hash into Chrome
+function updateUrlHash() {
+    let newHash = buildCurrentHash();
+    if (window.location.hash !== newHash) {
+        isUpdatingHashInternally = true;
+        history.replaceState(null, "", newHash);
+        // Reset flag after browser processes the microtask
+        setTimeout(() => { isUpdatingHashInternally = false; }, 0);
+    }
+}
+
+// React ONLY when the user manually changes or pastes a URL hash from external sources
 window.addEventListener('hashchange', () => {
+    if (isUpdatingHashInternally) return;
     loadStateFromHash();
     renderApp();
 });
+
 
 function updateHallsButtonText() {
     let btn = document.getElementById('btnHalls');
@@ -750,12 +762,7 @@ function buildCurrentHash() {
     return "#" + sp.toString();
 }
 
-function updateUrlHash() {
-    let newHash = buildCurrentHash();
-    if (window.location.hash !== newHash) {
-        history.replaceState(null, "", newHash);
-    }
-}
+
 
 async function copyShareableLink() {
     updateUrlHash();
