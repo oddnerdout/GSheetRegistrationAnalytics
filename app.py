@@ -36,7 +36,6 @@ def fetch_sheet_data_from_google():
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/115.0.0.0 Safari/537.36"
                 )
-                # Removed "Accept-Encoding": "gzip, deflate" so we receive plain text
             },
         )
         # 8 second timeout to avoid worker thread exhaustion
@@ -195,13 +194,10 @@ def get_cached_or_fresh_data(force_refresh=False):
     global cached_payload, cache_timestamp, last_good_payload
     now = time.time()
 
-    # Fast Read Path (No lock needed for read if fresh)
     if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
         return cached_payload, False
 
-    # Cache Expired or Forced Refresh: Synchronize with Lock
     with cache_lock:
-        # Re-check under lock (Double-checked locking pattern)
         now = time.time()
         if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
             return cached_payload, False
@@ -213,15 +209,13 @@ def get_cached_or_fresh_data(force_refresh=False):
             last_good_payload = fresh
             return cached_payload, True
         elif last_good_payload is not None:
-            # Fallback to stale data if Google Sheets failed
             print("[Warning] Serving stale cache due to upstream fetch failure.")
             return last_good_payload, False
         else:
             return {"headers": [], "rows": [], "col_map": {}}, False
 
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -633,6 +627,10 @@ function parseHashParams() {
     let raw = window.location.hash;
     if (!raw || raw.length <= 1) return {};
     let queryStr = raw.substring(1);
+    
+    // Crucial for iOS WebKit/Safari/Chrome: Replace '+' with '%20' so space characters in hashes are preserved
+    queryStr = queryStr.replace(/\+/g, '%20');
+    
     let urlParams = new URLSearchParams(queryStr);
     let params = {};
     for (let [k, v] of urlParams.entries()) {
@@ -641,13 +639,12 @@ function parseHashParams() {
     return params;
 }
 
-// Global flag to prevent internal hash updates from triggering hashchange reloading
 let isUpdatingHashInternally = false;
 
 function loadStateFromHash() {
     let params = parseHashParams();
 
-    // Mode: update ONLY if explicitly present in hash
+    // Mode
     if (params.mode !== undefined) {
         let m = parseInt(params.mode);
         if (!isNaN(m) && m >= 0 && m <= 4) {
@@ -656,34 +653,44 @@ function loadStateFromHash() {
         }
     }
 
-    // Halls: update ONLY if explicitly present in hash
+    // Halls: parse JSON or pipe-delimited string after converting '+' to spaces
     if (params.halls !== undefined && params.halls !== "") {
         let hallsList = [];
         try {
-            hallsList = JSON.parse(params.halls);
+            let sanitizedHallsStr = params.halls.replace(/\+/g, ' ');
+            hallsList = JSON.parse(sanitizedHallsStr);
         } catch(e) {
-            hallsList = params.halls.split('|').map(decodeURIComponent);
+            hallsList = params.halls.split('|').map(h => decodeURIComponent(h.replace(/\+/g, ' ')));
         }
         
         if (Array.isArray(hallsList) && hallsList.length > 0) {
             selectedHalls.clear();
             hallsList.forEach(h => {
-                if (allHalls.includes(h)) selectedHalls.add(h);
+                let cleanH = String(h).trim();
+                if (allHalls.includes(cleanH)) selectedHalls.add(cleanH);
             });
         }
+
+        // Safety fallback guard: if no halls matched due to URL discrepancies, fallback to selecting all halls
+        if (selectedHalls.size === 0 && allHalls.length > 0) {
+            selectedHalls = new Set(allHalls);
+        }
+
         updateHallsButtonText();
     }
 
-    // Transport: update ONLY if explicitly present in hash
+    // Transport
     if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
         transportFilter = params.trans;
         let shortTitle = transportFilter.replace(" Only", "");
-        document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
+        let btnTrans = document.getElementById('btnTransport');
+        if (btnTrans) btnTrans.innerText = `🚗 Trans: ${shortTitle}`;
     }
 
     // Search input
     if (params.search !== undefined) {
-        document.getElementById('searchInput').value = params.search;
+        let sInput = document.getElementById('searchInput');
+        if (sInput) sInput.value = params.search;
     }
 
     // Grouping & Sorting
@@ -708,18 +715,15 @@ function updateUrlHash() {
     if (window.location.hash !== newHash) {
         isUpdatingHashInternally = true;
         history.replaceState(null, "", newHash);
-        // Reset flag after browser processes the microtask
         setTimeout(() => { isUpdatingHashInternally = false; }, 0);
     }
 }
 
-// React ONLY when the user manually changes or pastes a URL hash from external sources
 window.addEventListener('hashchange', () => {
     if (isUpdatingHashInternally) return;
     loadStateFromHash();
     renderApp();
 });
-
 
 function updateHallsButtonText() {
     let btn = document.getElementById('btnHalls');
@@ -732,37 +736,35 @@ function updateHallsButtonText() {
 function buildCurrentHash() {
     let modeEl = document.querySelector('input[name="viewMode"]:checked');
     let mode = modeEl ? modeEl.value : "0";
-    let searchVal = document.getElementById('searchInput').value.trim();
+    let searchVal = (document.getElementById('searchInput')?.value || "").trim();
 
-    let sp = new URLSearchParams();
-    sp.set("mode", mode);
+    let parts = [];
+    parts.push("mode=" + encodeURIComponent(mode));
 
     if (selectedHalls.size > 0 && selectedHalls.size < allHalls.length) {
-        sp.set("halls", JSON.stringify(Array.from(selectedHalls)));
+        parts.push("halls=" + encodeURIComponent(JSON.stringify(Array.from(selectedHalls))));
     }
     if (transportFilter !== "All") {
-        sp.set("trans", transportFilter);
+        parts.push("trans=" + encodeURIComponent(transportFilter));
     }
     if (searchVal) {
-        sp.set("search", searchVal);
+        parts.push("search=" + encodeURIComponent(searchVal));
     }
     if (primaryGroupCol && primaryGroupCol !== headers[colMap.hall]) {
-        sp.set("primary", primaryGroupCol);
+        parts.push("primary=" + encodeURIComponent(primaryGroupCol));
     }
     if (secondaryGroupCol && secondaryGroupCol !== "__NONE__") {
-        sp.set("secondary", secondaryGroupCol);
+        parts.push("secondary=" + encodeURIComponent(secondaryGroupCol));
     }
     if (sortCol && sortCol !== headers[colMap.name]) {
-        sp.set("sort", sortCol);
+        parts.push("sort=" + encodeURIComponent(sortCol));
     }
     if (!sortAscending) {
-        sp.set("dir", "desc");
+        parts.push("dir=desc");
     }
 
-    return "#" + sp.toString();
+    return "#" + parts.join("&");
 }
-
-
 
 async function copyShareableLink() {
     updateUrlHash();
@@ -1421,19 +1423,16 @@ refreshData();
 @app.route("/")
 def index():
     resp = make_response(render_template_string(HTML_TEMPLATE))
-    # Cache the HTML shell on browser/edge for fast initial loads
     resp.headers["Cache-Control"] = "public, max-age=300"
     return resp
 
 
 @app.route("/api/data")
 def get_data():
-    # Allow explicit manual refresh with ?refresh=1
     force_refresh = request.args.get("refresh") in ["1", "true", "yes"]
     data, was_fresh = get_cached_or_fresh_data(force_refresh=force_refresh)
 
     resp = make_response(jsonify(data))
-    # Direct browser/proxies to cache the JSON payload for 30 seconds
     resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=60"
     return resp
 
