@@ -7,292 +7,1436 @@ import threading
 import urllib.request
 from flask import Flask, jsonify, render_template_string, request, make_response
 
-app = Flask(name)
+app = Flask(__name__)
 
-#Configuration
-
+# Configuration
 SHEET_ID = os.environ.get("SHEET_ID", "").strip()
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "60"))
 
-#In-Memory Cache State & Concurrency Lock
-
+# In-Memory Cache State & Concurrency Lock
 cache_lock = threading.Lock()
 cached_payload = None
 cache_timestamp = 0
 last_good_payload = None
 
+
 def fetch_sheet_data_from_google():
-"""Downloads and parses the Google Sheet from the hidden SHEET_ID."""
-if not SHEET_ID:
-print("[Error] SHEET_ID environment variable is not set.")
-return [], []
-
-url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
-try:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/115.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    # 8 second timeout to avoid worker thread exhaustion
-    with urllib.request.urlopen(req, timeout=8) as response:
-        csv_string_data = response.read().decode("utf-8", errors="replace")
-
-    # newline='' ensures multi-line cells aren't counted as multiple rows
-    csv_reader = csv.reader(io.StringIO(csv_string_data, newline=''))
-    raw_rows = list(csv_reader)
-
-    if len(raw_rows) < 4:
+    """Downloads and parses the Google Sheet from the hidden SHEET_ID."""
+    if not SHEET_ID:
+        print("[Error] SHEET_ID environment variable is not set.")
         return [], []
 
-    headers = [h.strip() for h in raw_rows[3]]
-    data_rows = raw_rows[4:] if len(raw_rows) > 4 else []
-    cleaned_rows = [r for r in data_rows if any(cell.strip() for cell in r)]
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/115.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        # 8 second timeout to avoid worker thread exhaustion
+        with urllib.request.urlopen(req, timeout=8) as response:
+            csv_string_data = response.read().decode("utf-8", errors="replace")
 
-    return headers, cleaned_rows
-except Exception as e:
-    print(f"[Error] Google Sheet fetch failed: {e}")
-    return [], []
+        # newline='' ensures multi-line cells aren't counted as multiple rows
+        csv_reader = csv.reader(io.StringIO(csv_string_data, newline=''))
+        raw_rows = list(csv_reader)
+
+        if len(raw_rows) < 4:
+            return [], []
+
+        headers = [h.strip() for h in raw_rows[3]]
+        data_rows = raw_rows[4:] if len(raw_rows) > 4 else []
+        cleaned_rows = [r for r in data_rows if any(cell.strip() for cell in r)]
+
+        return headers, cleaned_rows
+    except Exception as e:
+        print(f"[Error] Google Sheet fetch failed: {e}")
+        return [], []
 
 
 def find_col_idx(headers, keywords, fallback):
-if isinstance(keywords, str):
-keywords = [keywords]
-for kw in keywords:
-for idx, h in enumerate(headers):
-if kw.lower() in str(h).lower():
-return idx
-return fallback
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    for kw in keywords:
+        for idx, h in enumerate(headers):
+            if kw.lower() in str(h).lower():
+                return idx
+    return fallback
+
 
 def parse_transport_state(row, col_drive, col_ride, col_space):
-def get_val(idx):
-return str(row[idx]).strip() if 0 <= idx < len(row) else ""
+    def get_val(idx):
+        return str(row[idx]).strip() if 0 <= idx < len(row) else ""
 
-driver_val = get_val(col_drive)
-ride_val = get_val(col_ride)
-space_val = get_val(col_space)
+    driver_val = get_val(col_drive)
+    ride_val = get_val(col_ride)
+    space_val = get_val(col_space)
 
-d_lower = driver_val.lower()
-r_lower = ride_val.lower()
-s_lower = space_val.lower()
+    d_lower = driver_val.lower()
+    r_lower = ride_val.lower()
+    s_lower = space_val.lower()
 
-explicit_driver_yes = (
-    d_lower.startswith("y") or d_lower == "true" or "driver" in d_lower
-)
-explicit_driver_no = (
-    d_lower.startswith("n") or d_lower == "false" or "none" in d_lower
-)
+    explicit_driver_yes = (
+        d_lower.startswith("y") or d_lower == "true" or "driver" in d_lower
+    )
+    explicit_driver_no = (
+        d_lower.startswith("n") or d_lower == "false" or "none" in d_lower
+    )
 
-has_valid_space = bool(space_val) and not (
-    s_lower in ["0", "none", "n/a", "na", "no", "nil", "-"]
-    or "no space" in s_lower
-    or "no vehicle" in s_lower
-)
+    has_valid_space = bool(space_val) and not (
+        s_lower in ["0", "none", "n/a", "na", "no", "nil", "-"]
+        or "no space" in s_lower
+        or "no vehicle" in s_lower
+    )
 
-is_driver = explicit_driver_yes or (
-    has_valid_space and not explicit_driver_no
-)
-is_ride_req = (
-    r_lower.startswith("y") or r_lower == "true" or "yes" in r_lower
-)
+    is_driver = explicit_driver_yes or (
+        has_valid_space and not explicit_driver_no
+    )
+    is_ride_req = (
+        r_lower.startswith("y") or r_lower == "true" or "yes" in r_lower
+    )
 
-seat_count = 0
-if is_driver and has_valid_space:
-    nums = re.findall(r"\d+", space_val)
-    if nums:
-        seat_count = int(nums[0])
-    elif "van" in s_lower:
-        seat_count = 6
+    seat_count = 0
+    if is_driver and has_valid_space:
+        nums = re.findall(r"\d+", space_val)
+        if nums:
+            seat_count = int(nums[0])
+        elif "van" in s_lower:
+            seat_count = 6
 
-return {
-    "is_driver": is_driver,
-    "explicit_driver_no": explicit_driver_no,
-    "space_val": space_val,
-    "seat_count": seat_count,
-    "has_valid_space": has_valid_space,
-    "is_ride_req": is_ride_req,
-}
+    return {
+        "is_driver": is_driver,
+        "explicit_driver_no": explicit_driver_no,
+        "space_val": space_val,
+        "seat_count": seat_count,
+        "has_valid_space": has_valid_space,
+        "is_ride_req": is_ride_req,
+    }
 
 
 def infer_timing(status_val):
-status = status_val.lower().strip()
-
-if "sat" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
-    return "Saturday", "Sunday (Lord's Day)"
-elif "fri" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
-    return "Friday", "Saturday"
-elif "day-only" in status or "day only" in status or "offsite" in status or "1 day" in status or "(1 day)" in status:
-    return "Saturday", "Saturday"
-elif "full time" in status or "full-time" in status or "all weekend" in status or "full" in status:
-    return "Friday", "Sunday (Lord's Day)"
-elif "friday" in status or "fri" in status:
-    return "Friday", "Friday (Day Only)"
-elif "sunday" in status or "lord's day" in status or "lords day" in status:
-    return "Sunday (Lord's Day)", "Sunday (Lord's Day)"
-elif "saturday" in status or "sat" in status:
-    return "Saturday", "Saturday"
+    status = status_val.lower().strip()
     
-return "Unknown Timing", "Unknown Timing"
+    if "sat" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
+        return "Saturday", "Sunday (Lord's Day)"
+    elif "fri" in status and ("night" in status or "part-time" in status or "part time" in status or "overnight" in status):
+        return "Friday", "Saturday"
+    elif "day-only" in status or "day only" in status or "offsite" in status or "1 day" in status or "(1 day)" in status:
+        return "Saturday", "Saturday"
+    elif "full time" in status or "full-time" in status or "all weekend" in status or "full" in status:
+        return "Friday", "Sunday (Lord's Day)"
+    elif "friday" in status or "fri" in status:
+        return "Friday", "Friday (Day Only)"
+    elif "sunday" in status or "lord's day" in status or "lords day" in status:
+        return "Sunday (Lord's Day)", "Sunday (Lord's Day)"
+    elif "saturday" in status or "sat" in status:
+        return "Saturday", "Saturday"
+        
+    return "Unknown Timing", "Unknown Timing"
 
 
 def generate_fresh_payload():
-"""Fetches and transforms the Google Sheet into the API response format."""
-headers, rows = fetch_sheet_data_from_google()
-if not headers and not rows:
-return None
+    """Fetches and transforms the Google Sheet into the API response format."""
+    headers, rows = fetch_sheet_data_from_google()
+    if not headers and not rows:
+        return None
 
-col_name = find_col_idx(headers, ["full name", "name", "attendee", "participant"], 0)
-col_hall = find_col_idx(headers, ["locality", "hall", "locality/hall", "church"], -1)
-col_district = find_col_idx(headers, ["district", "region", "area", "zone"], -1)
-col_status = find_col_idx(
-    headers,
-    ["camp stay", "stay type", "status", "registration type", "attending", "full time", "registration"],
-    -1,
-)
-col_ride = find_col_idx(headers, ["need a ride", "ride request", "need ride", "passenger"], -1)
-col_drive = find_col_idx(headers, ["give rides", "driver", "can you drive", "can you give"], -1)
-col_space = find_col_idx(headers, ["space", "capacity", "seats", "how much space", "vehicle"], -1)
-
-processed_rows = []
-for r in rows:
-    tstate = parse_transport_state(r, col_drive, col_ride, col_space)
-    status_val = r[col_status] if 0 <= col_status < len(r) else ""
-    arrive, depart = infer_timing(status_val)
-
-    processed_rows.append(
-        {
-            "data": r,
-            "_tstate": tstate,
-            "_arrive": arrive,
-            "_depart": depart,
-        }
+    col_name = find_col_idx(headers, ["full name", "name", "attendee", "participant"], 0)
+    col_hall = find_col_idx(headers, ["locality", "hall", "locality/hall", "church"], -1)
+    col_district = find_col_idx(headers, ["district", "region", "area", "zone"], -1)
+    col_status = find_col_idx(
+        headers,
+        ["camp stay", "stay type", "status", "registration type", "attending", "full time", "registration"],
+        -1,
     )
+    col_ride = find_col_idx(headers, ["need a ride", "ride request", "need ride", "passenger"], -1)
+    col_drive = find_col_idx(headers, ["give rides", "driver", "can you drive", "can you give"], -1)
+    col_space = find_col_idx(headers, ["space", "capacity", "seats", "how much space", "vehicle"], -1)
 
-return {
-    "headers": headers,
-    "rows": processed_rows,
-    "col_map": {
-        "name": col_name,
-        "hall": col_hall,
-        "district": col_district,
-        "status": col_status,
-    },
-    "cached_at": time.time(),
-}
+    processed_rows = []
+    for r in rows:
+        tstate = parse_transport_state(r, col_drive, col_ride, col_space)
+        status_val = r[col_status] if 0 <= col_status < len(r) else ""
+        arrive, depart = infer_timing(status_val)
+
+        processed_rows.append(
+            {
+                "data": r,
+                "_tstate": tstate,
+                "_arrive": arrive,
+                "_depart": depart,
+            }
+        )
+
+    return {
+        "headers": headers,
+        "rows": processed_rows,
+        "col_map": {
+            "name": col_name,
+            "hall": col_hall,
+            "district": col_district,
+            "status": col_status,
+        },
+        "cached_at": time.time(),
+    }
 
 
 def get_cached_or_fresh_data(force_refresh=False):
-"""
-Thread-safe Cache accessor.
-Prevents cache stampedes and serves stale data if Google Sheets fails.
-"""
-global cached_payload, cache_timestamp, last_good_payload
-now = time.time()
-
-# Fast Read Path (No lock needed for read if fresh)
-if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
-    return cached_payload, False
-
-# Cache Expired or Forced Refresh: Synchronize with Lock
-with cache_lock:
+    """
+    Thread-safe Cache accessor.
+    Prevents cache stampedes and serves stale data if Google Sheets fails.
+    """
+    global cached_payload, cache_timestamp, last_good_payload
     now = time.time()
+
     if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
         return cached_payload, False
 
-    fresh = generate_fresh_payload()
-    if fresh is not None:
-        cached_payload = fresh
-        cache_timestamp = now
-        last_good_payload = fresh
-        return cached_payload, True
-    elif last_good_payload is not None:
-        print("[Warning] Serving stale cache due to upstream fetch failure.")
-        return last_good_payload, False
-    else:
-        return {"headers": [], "rows": [], "col_map": {}}, False
+    with cache_lock:
+        now = time.time()
+        if not force_refresh and cached_payload is not None and (now - cache_timestamp) < CACHE_TTL_SECONDS:
+            return cached_payload, False
+
+        fresh = generate_fresh_payload()
+        if fresh is not None:
+            cached_payload = fresh
+            cache_timestamp = now
+            last_good_payload = fresh
+            return cached_payload, True
+        elif last_good_payload is not None:
+            print("[Warning] Serving stale cache due to upstream fetch failure.")
+            return last_good_payload, False
+        else:
+            return {"headers": [], "rows": [], "col_map": {}}, False
 
 
-HTML_TEMPLATE = r"""
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Camp Comm Center</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { 
+            background-color: #f2f2f7; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            color: #1c1c1e;
+        }
+        .sticky-top-panel { 
+            position: sticky; 
+            top: 0; 
+            z-index: 1000; 
+            background-color: #ffffff; 
+            border-bottom: 1px solid #d1d1d6; 
+            padding: 10px; 
+        }
+        .btn-segment {
+            font-weight: 600;
+            font-size: 0.78rem;
+            padding: 6px 4px;
+        }
+        .card-header-g1 { 
+            font-weight: bold; 
+            padding: 8px 12px; 
+            margin-top: 12px; 
+            border-radius: 6px 6px 0 0; 
+            font-size: 0.95rem;
+            background-color: #e5e9f0;
+            color: #1f2d3d;
+        }
+        .card-header-g2 { 
+            font-weight: 600; 
+            padding: 6px 12px; 
+            border-bottom: 1px solid #e5e5ea;
+            font-size: 0.85rem;
+            background-color: #f4f6f9;
+            color: #4a5568;
+        }
+        .card-header-surplus {
+            background-color: #e6ffed !important;
+            color: #22863a !important;
+            border: 1px solid #b4f1c5;
+        }
+        .card-header-deficit {
+            background-color: #ffe5e5 !important;
+            color: #d73a49 !important;
+            border: 1px solid #f8b4b4;
+        }
+        .badge-req { 
+            background-color: #ffebee;
+            color: #d73a49; 
+            font-weight: 700; 
+            font-size: 0.78rem; 
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #ffcdd2;
+            white-space: nowrap;
+        }
+        .badge-driver { 
+            background-color: #e8f5e9;
+            color: #28a745; 
+            font-weight: 700; 
+            font-size: 0.78rem; 
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #c8e6c9;
+            white-space: nowrap;
+        }
+        .badge-offer { 
+            background-color: #e3f2fd;
+            color: #007aff; 
+            font-weight: 700; 
+            font-size: 0.78rem; 
+            padding: 4px 8px;
+            border-radius: 6px;
+            border: 1px solid #bbdefb;
+            white-space: nowrap;
+        }
+        .badge-hall-tag {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #3a3a3c;
+            background-color: #e5e5ea;
+            padding: 2px 6px;
+            border-radius: 4px;
+            max-width: 100%;
+            display: inline-block;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            vertical-align: middle;
+        }
+        .list-group-item { 
+            cursor: pointer; 
+            transition: background-color 0.15s;
+            border-color: #e5e5ea;
+        }
+        .list-group-item:active { background-color: #e5e5ea; }
+        .dense-row { padding: 6px 12px; }
+        .hall-checkbox-item { cursor: pointer; }
+        .matrix-table-container {
+            overflow-x: auto;
+            background: #ffffff;
+            border-radius: 8px;
+            border: 1px solid #d1d1d6;
+            margin-bottom: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .table-matrix th, .table-matrix td {
+            text-align: center;
+            font-size: 0.85rem;
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+        .table-matrix th:first-child, .table-matrix td:first-child {
+            text-align: left;
+            font-weight: 600;
+        }
+        .matrix-title {
+            font-size: 0.95rem;
+            font-weight: bold;
+            color: #1f2d3d;
+            padding: 10px 14px;
+            background-color: #f8f9fa;
+            border-bottom: 1px solid #e5e5ea;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }
+        .spin {
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
 
-        <input type="radio" class="btn-check" name="viewMode" id="vm1" value="1" onchange="renderApp()">
-        <label class="btn btn-outline-primary btn-segment" for="vm1">Roster</label>
+<div class="sticky-top-panel shadow-sm">
+    <div class="container-fluid px-1">
+        <!-- Row 1: Segment Controller -->
+        <div class="btn-group w-100 mb-2 shadow-none" role="group">
+            <input type="radio" class="btn-check" name="viewMode" id="vm0" value="0" checked onchange="renderApp()">
+            <label class="btn btn-outline-primary btn-segment" for="vm0">Classic</label>
 
-        <input type="radio" class="btn-check" name="viewMode" id="vm2" value="2" onchange="renderApp()">
-        <label class="btn btn-outline-primary btn-segment" for="vm2">To Camp 🚐</label>
+            <input type="radio" class="btn-check" name="viewMode" id="vm1" value="1" onchange="renderApp()">
+            <label class="btn btn-outline-primary btn-segment" for="vm1">Roster</label>
 
-        <input type="radio" class="btn-check" name="viewMode" id="vm3" value="3" onchange="renderApp()">
-        <label class="btn btn-outline-primary btn-segment" for="vm3">To NYC 🚐</label>
+            <input type="radio" class="btn-check" name="viewMode" id="vm2" value="2" onchange="renderApp()">
+            <label class="btn btn-outline-primary btn-segment" for="vm2">To Camp 🚐</label>
 
-        <input type="radio" class="btn-check" name="viewMode" id="vm4" value="4" onchange="renderApp()">
-        <label class="btn btn-outline-primary btn-segment" for="vm4">📊 Matrix</label>
-    </div>
+            <input type="radio" class="btn-check" name="viewMode" id="vm3" value="3" onchange="renderApp()">
+            <label class="btn btn-outline-primary btn-segment" for="vm3">To NYC 🚐</label>
 
-    <!-- Row 2: Filter Buttons (Halls & Transport) -->
-    <div class="row g-2 mb-2">
-        <div class="col-6">
-            <button id="btnHalls" class="btn btn-primary btn-sm w-100 fw-bold text-truncate" onclick="openHallsModal()">📍 Halls: All</button>
+            <input type="radio" class="btn-check" name="viewMode" id="vm4" value="4" onchange="renderApp()">
+            <label class="btn btn-outline-primary btn-segment" for="vm4">📊 Matrix</label>
         </div>
-        <div class="col-6">
-            <div class="dropdown">
-                <button id="btnTransport" class="btn btn-warning text-dark btn-sm w-100 fw-bold dropdown-toggle text-truncate" type="button" data-bs-toggle="dropdown">
-                    🚗 Trans: All
-                </button>
-                <ul class="dropdown-menu w-100 shadow">
-                    <li><a class="dropdown-item" href="#" onclick="setTransportFilter('All')">All</a></li>
-                    <li><a class="dropdown-item" href="#" onclick="setTransportFilter('Drivers Only')">Drivers Only</a></li>
-                    <li><a class="dropdown-item" href="#" onclick="setTransportFilter('Ride Requests Only')">Ride Requests Only</a></li>
-                </ul>
+
+        <!-- Row 2: Filter Buttons (Halls & Transport) -->
+        <div class="row g-2 mb-2">
+            <div class="col-6">
+                <button id="btnHalls" class="btn btn-primary btn-sm w-100 fw-bold text-truncate" onclick="openHallsModal()">📍 Halls: All</button>
+            </div>
+            <div class="col-6">
+                <div class="dropdown">
+                    <button id="btnTransport" class="btn btn-warning text-dark btn-sm w-100 fw-bold dropdown-toggle text-truncate" type="button" data-bs-toggle="dropdown">
+                        🚗 Trans: All
+                    </button>
+                    <ul class="dropdown-menu w-100 shadow">
+                        <li><a class="dropdown-item" href="#" onclick="setTransportFilter('All')">All</a></li>
+                        <li><a class="dropdown-item" href="#" onclick="setTransportFilter('Drivers Only')">Drivers Only</a></li>
+                        <li><a class="dropdown-item" href="#" onclick="setTransportFilter('Ride Requests Only')">Ride Requests Only</a></li>
+                    </ul>
+                </div>
             </div>
         </div>
-    </div>
 
-    <!-- Row 3: Settings, Copy Link, and Refresh -->
-    <div class="row g-2 mb-2">
-        <div class="col-7">
-            <button class="btn btn-secondary btn-sm w-100 fw-bold" style="background-color: #5856d6; border-color: #5856d6;" data-bs-toggle="modal" data-bs-target="#settingsModal">
-                ⚙️ Settings
-            </button>
+        <!-- Row 3: Settings, Copy Link, and Refresh -->
+        <div class="row g-2 mb-2">
+            <div class="col-7">
+                <button class="btn btn-secondary btn-sm w-100 fw-bold" style="background-color: #5856d6; border-color: #5856d6;" data-bs-toggle="modal" data-bs-target="#settingsModal">
+                    ⚙️ Settings
+                </button>
+            </div>
+            <div class="col-3">
+                <button class="btn btn-outline-primary btn-sm w-100 fw-bold" onclick="copyShareableLink()" title="Copy Link with Current Filters">
+                    🔗 Share
+                </button>
+            </div>
+            <div class="col-2">
+                <button id="btnRefresh" class="btn btn-success btn-sm w-100 fw-bold" onclick="refreshData(true)" title="Force Refresh Sheet Data">
+                    🔄
+                </button>
+            </div>
         </div>
-        <div class="col-3">
-            <button class="btn btn-outline-primary btn-sm w-100 fw-bold" onclick="copyShareableLink()" title="Copy Link with Current Filters">
-                🔗 Share
-            </button>
-        </div>
-        <div class="col-2">
-            <button id="btnRefresh" class="btn btn-success btn-sm w-100 fw-bold" onclick="refreshData(true)" title="Force Refresh Sheet Data">
-                🔄
-            </button>
-        </div>
-    </div>
 
-    <!-- Row 4: Search -->
-    <div>
-        <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search attendees, rides, locations..." oninput="renderApp()">
+        <!-- Row 4: Search -->
+        <div>
+            <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search attendees, rides, locations..." oninput="renderApp()">
+        </div>
     </div>
 </div>
+
+<div class="container py-2">
+    <div id="statusAlert" class="alert alert-warning d-none" role="alert"></div>
+    <div id="toastContainer" class="position-fixed bottom-0 end-0 p-3" style="z-index: 1100"></div>
+    <div id="contentList"></div>
+</div>
+
+<!-- Localities Multi-Select Modal -->
+<div class="modal fade" id="hallsModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title fw-bold">Select Localities/Halls</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-content-between mb-3">
+            <button class="btn btn-outline-secondary btn-sm" onclick="selectAllHalls(true)">Select All</button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="selectAllHalls(false)">Clear All</button>
+        </div>
+        <div id="hallsCheckboxList" class="list-group"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary w-100" data-bs-dismiss="modal" onclick="applyHallSelection()">Apply</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal fade" id="settingsModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title fw-bold">⚙️ Dashboard Settings</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+            <label class="form-label fw-bold small">Primary Group By (Classic & Roster)</label>
+            <select id="selPrimaryGroup" class="form-select form-select-sm"></select>
+        </div>
+        <div class="mb-3">
+            <label class="form-label fw-bold small">Secondary Group By (Classic)</label>
+            <select id="selSecondaryGroup" class="form-select form-select-sm">
+                <option value="__NONE__">(None / Disabled)</option>
+            </select>
+        </div>
+        <div class="mb-3">
+            <label class="form-label fw-bold small">Sort Column</label>
+            <select id="selSortCol" class="form-select form-select-sm"></select>
+        </div>
+        <div class="mb-3">
+            <label class="form-label fw-bold small">Sort Direction</label>
+            <select id="selSortDir" class="form-select form-select-sm">
+                <option value="asc">Ascending (A → Z)</option>
+                <option value="desc">Descending (Z → A)</option>
+            </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary w-100" data-bs-dismiss="modal" onclick="saveSettings()">Save Changes</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Share Link Modal Fallback -->
+<div class="modal fade" id="shareModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title fw-bold">🔗 Share Pre-filtered Link</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="small text-muted mb-2">Anyone opening this link will see your exact view, filters, and groups:</p>
+        <div class="input-group mb-3">
+          <input type="text" id="shareLinkInput" class="form-control form-control-sm" readonly>
+          <button class="btn btn-primary btn-sm fw-bold" onclick="copyFromShareModal()">Copy</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Details Modal -->
+<div class="modal fade" id="detailModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title fw-bold" id="modalTitle">Attendee Details</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+let rawData = [];
+let headers = [];
+let colMap = {};
+let allHalls = [];
+let selectedHalls = new Set();
+let transportFilter = "All";
+
+let primaryGroupCol = "";
+let secondaryGroupCol = "";
+let sortCol = "";
+let sortAscending = true;
+let isInitializedFromHash = false;
+
+function jsFindColIdx(headerList, keywords, fallback) {
+    if (!Array.isArray(keywords)) keywords = [keywords];
+    for (let kw of keywords) {
+        for (let i = 0; i < headerList.length; i++) {
+            if (headerList[i] && headerList[i].toLowerCase().includes(kw.toLowerCase())) {
+                return i;
+            }
+        }
+    }
+    return fallback;
+}
+
+function abbreviateLocality(name) {
+    if (!name || name === "Unassigned" || name === "All Data") return name || "N/A";
+    let cleaned = name.replace(/church in/gi, "").replace(/locality/gi, "").replace(/hall/gi, "").trim();
+    let words = cleaned.split(/[\s\-\/\,]+/).filter(w => w.length > 0);
+    if (words.length === 1) {
+        return words[0].substring(0, 6).toUpperCase();
+    }
+    return words.map(w => w[0]).join("").toUpperCase();
+}
+
+async function refreshData(force = false) {
+    let alertBox = document.getElementById('statusAlert');
+    let btnRefresh = document.getElementById('btnRefresh');
+    alertBox.classList.add('d-none');
+    
+    if (btnRefresh) {
+        btnRefresh.classList.add('disabled');
+        btnRefresh.innerHTML = '<span class="d-inline-block spin">🔄</span>';
+    }
+
+    try {
+        let endpoint = force ? '/api/data?refresh=1' : '/api/data';
+        let res = await fetch(endpoint);
+        let json = await res.json();
+        rawData = json.rows || [];
+        headers = json.headers || [];
+        colMap = json.col_map || {};
+
+        if (rawData.length === 0) {
+            alertBox.innerText = "No data found. Ensure SHEET_ID is configured on Render and the sheet has link sharing set to 'Anyone with the link can view'.";
+            alertBox.classList.remove('d-none');
+            return;
+        }
+
+        // Initialize Halls
+        let halls = new Set();
+        rawData.forEach(r => {
+            let h = (r.data[colMap.hall] || "").trim();
+            if (h) halls.add(h);
+        });
+        allHalls = Array.from(halls).sort();
+        if (allHalls.length === 0) allHalls = ["All Data"];
+        
+        if (selectedHalls.size === 0) {
+            selectedHalls = new Set(allHalls);
+        }
+
+        primaryGroupCol = headers[colMap.hall] || headers[0] || "";
+        sortCol = headers[colMap.name] || headers[0] || "";
+        
+        let secCandidate = headers.find(h => /camp stay|stay type|status|registration/i.test(h));
+        secondaryGroupCol = secCandidate || "__NONE__";
+
+        populateSettingsDropdowns();
+
+        if (!isInitializedFromHash) {
+            loadStateFromHash();
+            isInitializedFromHash = true;
+        }
+
+        renderApp();
+        if (force) showToast("✅ Data synchronized with Google Sheet.");
+    } catch (err) {
+        console.error(err);
+        alertBox.innerText = "Error loading data. Check server logs.";
+        alertBox.classList.remove('d-none');
+    } finally {
+        if (btnRefresh) {
+            btnRefresh.classList.remove('disabled');
+            btnRefresh.innerHTML = '🔄';
+        }
+    }
+}
+
+function parseHashParams() {
+    let raw = window.location.hash;
+    if (!raw || raw.length <= 1) return {};
+    let queryStr = raw.substring(1);
+    
+    // Crucial for iOS WebKit/Safari/Chrome: Replace '+' with '%20' so space characters in hashes are preserved
+    queryStr = queryStr.replace(/\+/g, '%20');
+    
+    let urlParams = new URLSearchParams(queryStr);
+    let params = {};
+    for (let [k, v] of urlParams.entries()) {
+        params[k] = v;
+    }
+    return params;
+}
+
+let isUpdatingHashInternally = false;
+
+function loadStateFromHash() {
+    let params = parseHashParams();
+
+    // Mode
+    if (params.mode !== undefined) {
+        let m = parseInt(params.mode);
+        if (!isNaN(m) && m >= 0 && m <= 4) {
+            let radio = document.getElementById('vm' + m);
+            if (radio) radio.checked = true;
+        }
+    }
+
+    // Halls: parse JSON or pipe-delimited string after converting '+' to spaces
+    if (params.halls !== undefined && params.halls !== "") {
+        let hallsList = [];
+        try {
+            let sanitizedHallsStr = params.halls.replace(/\+/g, ' ');
+            hallsList = JSON.parse(sanitizedHallsStr);
+        } catch(e) {
+            hallsList = params.halls.split('|').map(h => decodeURIComponent(h.replace(/\+/g, ' ')));
+        }
+        
+        if (Array.isArray(hallsList) && hallsList.length > 0) {
+            selectedHalls.clear();
+            hallsList.forEach(h => {
+                let cleanH = String(h).trim();
+                if (allHalls.includes(cleanH)) selectedHalls.add(cleanH);
+            });
+        }
+
+        // Safety fallback guard: if no halls matched due to URL discrepancies, fallback to selecting all halls
+        if (selectedHalls.size === 0 && allHalls.length > 0) {
+            selectedHalls = new Set(allHalls);
+        }
+
+        updateHallsButtonText();
+    }
+
+    // Transport
+    if (params.trans !== undefined && ["All", "Drivers Only", "Ride Requests Only"].includes(params.trans)) {
+        transportFilter = params.trans;
+        let shortTitle = transportFilter.replace(" Only", "");
+        let btnTrans = document.getElementById('btnTransport');
+        if (btnTrans) btnTrans.innerText = `🚗 Trans: ${shortTitle}`;
+    }
+
+    // Search input
+    if (params.search !== undefined) {
+        let sInput = document.getElementById('searchInput');
+        if (sInput) sInput.value = params.search;
+    }
+
+    // Grouping & Sorting
+    if (params.primary !== undefined && headers.includes(params.primary)) {
+        primaryGroupCol = params.primary;
+    }
+    if (params.secondary !== undefined && (params.secondary === "__NONE__" || headers.includes(params.secondary))) {
+        secondaryGroupCol = params.secondary;
+    }
+    if (params.sort !== undefined && headers.includes(params.sort)) {
+        sortCol = params.sort;
+    }
+    if (params.dir !== undefined) {
+        sortAscending = (params.dir === "asc");
+    }
+
+    populateSettingsDropdowns();
+}
+
+function updateUrlHash() {
+    let newHash = buildCurrentHash();
+    if (window.location.hash !== newHash) {
+        isUpdatingHashInternally = true;
+        history.replaceState(null, "", newHash);
+        setTimeout(() => { isUpdatingHashInternally = false; }, 0);
+    }
+}
+
+window.addEventListener('hashchange', () => {
+    if (isUpdatingHashInternally) return;
+    loadStateFromHash();
+    renderApp();
+});
+
+function updateHallsButtonText() {
+    let btn = document.getElementById('btnHalls');
+    if (!btn) return;
+    if (selectedHalls.size === allHalls.length) btn.innerText = "📍 Halls: All";
+    else if (selectedHalls.size === 0) btn.innerText = "📍 Halls: None";
+    else btn.innerText = `📍 Halls: (${selectedHalls.size})`;
+}
+
+function buildCurrentHash() {
+    let modeEl = document.querySelector('input[name="viewMode"]:checked');
+    let mode = modeEl ? modeEl.value : "0";
+    let searchVal = (document.getElementById('searchInput')?.value || "").trim();
+
+    let parts = [];
+    parts.push("mode=" + encodeURIComponent(mode));
+
+    if (selectedHalls.size > 0 && selectedHalls.size < allHalls.length) {
+        parts.push("halls=" + encodeURIComponent(JSON.stringify(Array.from(selectedHalls))));
+    }
+    if (transportFilter !== "All") {
+        parts.push("trans=" + encodeURIComponent(transportFilter));
+    }
+    if (searchVal) {
+        parts.push("search=" + encodeURIComponent(searchVal));
+    }
+    if (primaryGroupCol && primaryGroupCol !== headers[colMap.hall]) {
+        parts.push("primary=" + encodeURIComponent(primaryGroupCol));
+    }
+    if (secondaryGroupCol && secondaryGroupCol !== "__NONE__") {
+        parts.push("secondary=" + encodeURIComponent(secondaryGroupCol));
+    }
+    if (sortCol && sortCol !== headers[colMap.name]) {
+        parts.push("sort=" + encodeURIComponent(sortCol));
+    }
+    if (!sortAscending) {
+        parts.push("dir=desc");
+    }
+
+    return "#" + parts.join("&");
+}
+
+async function copyShareableLink() {
+    updateUrlHash();
+    let currentUrl = window.location.href;
+
+    if (navigator.share && /mobile|android|iphone|ipad/i.test(navigator.userAgent)) {
+        try {
+            await navigator.share({
+                title: 'Camp Comm Center Dashboard',
+                url: currentUrl
+            });
+            return;
+        } catch (err) {}
+    }
+
+    let success = false;
+    let tempInput = document.createElement("textarea");
+    tempInput.style.position = "fixed";
+    tempInput.style.top = "0";
+    tempInput.style.left = "0";
+    tempInput.style.opacity = "0";
+    tempInput.value = currentUrl;
+    document.body.appendChild(tempInput);
+    tempInput.focus();
+    tempInput.select();
+
+    try {
+        success = document.execCommand('copy');
+    } catch (e) {
+        success = false;
+    }
+    document.body.removeChild(tempInput);
+
+    if (success) {
+        showToast("🔗 Pre-filtered link copied to clipboard!");
+    } else {
+        document.getElementById('shareLinkInput').value = currentUrl;
+        let shareModal = new bootstrap.Modal(document.getElementById('shareModal'));
+        shareModal.show();
+    }
+}
+
+function copyFromShareModal() {
+    let copyText = document.getElementById("shareLinkInput");
+    copyText.select();
+    copyText.setSelectionRange(0, 99999);
+    try {
+        document.execCommand("copy");
+        showToast("🔗 Link copied!");
+    } catch (e) {
+        showToast("Please copy the link directly.");
+    }
+}
+
+function showToast(message) {
+    let container = document.getElementById('toastContainer');
+    let toast = document.createElement('div');
+    toast.className = "toast align-items-center text-white bg-dark border-0 show shadow";
+    toast.role = "alert";
+    toast.innerHTML = `
+        <div class="d-flex">
+            <div class="toast-body">${message}</div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" onclick="this.closest('.toast').remove()"></button>
+        </div>
+    `;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 3000);
+}
+
+function populateSettingsDropdowns() {
+    let selP = document.getElementById('selPrimaryGroup');
+    let selS = document.getElementById('selSecondaryGroup');
+    let selSort = document.getElementById('selSortCol');
+    let selDir = document.getElementById('selSortDir');
+
+    if (!selP || !selS || !selSort || !selDir) return;
+
+    selP.innerHTML = "";
+    selS.innerHTML = '<option value="__NONE__">(None / Disabled)</option>';
+    selSort.innerHTML = "";
+
+    headers.forEach(h => {
+        if (!h.trim()) return;
+        let opt1 = new Option(h, h, false, h === primaryGroupCol);
+        let opt2 = new Option(h, h, false, h === secondaryGroupCol);
+        let opt3 = new Option(h, h, false, h === sortCol);
+
+        selP.add(opt1);
+        selS.add(opt2);
+        selSort.add(opt3);
+    });
+
+    selDir.value = sortAscending ? "asc" : "desc";
+}
+
+function saveSettings() {
+    primaryGroupCol = document.getElementById('selPrimaryGroup').value;
+    secondaryGroupCol = document.getElementById('selSecondaryGroup').value;
+    sortCol = document.getElementById('selSortCol').value;
+    sortAscending = (document.getElementById('selSortDir').value === "asc");
+    renderApp();
+}
+
+function openHallsModal() {
+    let list = document.getElementById('hallsCheckboxList');
+    list.innerHTML = "";
+    allHalls.forEach(h => {
+        let isChecked = selectedHalls.has(h);
+        let item = document.createElement('label');
+        item.className = "list-group-item d-flex align-items-center hall-checkbox-item";
+        item.innerHTML = `
+            <input class="form-check-input me-2 hall-cb" type="checkbox" value="${encodeURIComponent(h)}" ${isChecked ? 'checked' : ''}>
+            <span>${h}</span>
+        `;
+        list.appendChild(item);
+    });
+    new bootstrap.Modal(document.getElementById('hallsModal')).show();
+}
+
+function selectAllHalls(check) {
+    document.querySelectorAll('.hall-cb').forEach(cb => cb.checked = check);
+}
+
+function applyHallSelection() {
+    selectedHalls.clear();
+    document.querySelectorAll('.hall-cb').forEach(cb => {
+        if (cb.checked) selectedHalls.add(decodeURIComponent(cb.value));
+    });
+    updateHallsButtonText();
+    renderApp();
+}
+
+function setTransportFilter(filterVal) {
+    transportFilter = filterVal;
+    let shortTitle = filterVal.replace(" Only", "");
+    document.getElementById('btnTransport').innerText = `🚗 Trans: ${shortTitle}`;
+    renderApp();
+}
+
+function renderApp() {
+    updateUrlHash();
+
+    let modeEl = document.querySelector('input[name="viewMode"]:checked');
+    let mode = modeEl ? parseInt(modeEl.value) : 0;
+    let query = (document.getElementById('searchInput').value || "").toLowerCase().trim();
+
+    let pIdx = headers.indexOf(primaryGroupCol);
+    let sIdx = secondaryGroupCol !== "__NONE__" ? headers.indexOf(secondaryGroupCol) : -1;
+    let sortIdx = headers.indexOf(sortCol);
+    if (sortIdx < 0) sortIdx = colMap.name;
+
+    // 1. FILTERING
+    let filtered = rawData.filter(r => {
+        let hallVal = (r.data[colMap.hall] || "").trim();
+        if (colMap.hall >= 0 && hallVal && !selectedHalls.has(hallVal)) return false;
+
+        let tState = r._tstate;
+        if (transportFilter === "Drivers Only" && !(tState.is_driver || tState.has_valid_space)) return false;
+        if (transportFilter === "Ride Requests Only" && !tState.is_ride_req) return false;
+
+        if (query && !r.data.some(cell => String(cell).toLowerCase().includes(query))) {
+            return false;
+        }
+        return true;
+    });
+
+    // 2. SORTING
+    const timeWeights = { "Friday": 1, "Saturday": 2, "Saturday (Day Only)": 3, "Sunday (Lord's Day)": 4, "Unknown Timing": 5 };
+
+    filtered.sort((a, b) => {
+        let aVal = (a.data[sortIdx] || "").toString().toLowerCase();
+        let bVal = (b.data[sortIdx] || "").toString().toLowerCase();
+
+        if (mode === 2 || mode === 3) {
+            let tA = mode === 2 ? a._arrive : a._depart;
+            let tB = mode === 2 ? b._arrive : b._depart;
+            let wA = timeWeights[tA] || 99;
+            let wB = timeWeights[tB] || 99;
+            if (wA !== wB) return wA - wB;
+            return sortAscending ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+        } else {
+            let aP = pIdx >= 0 ? (a.data[pIdx] || "").toString().toLowerCase() : "";
+            let bP = pIdx >= 0 ? (b.data[pIdx] || "").toString().toLowerCase() : "";
+            if (aP !== bP) {
+                return sortAscending ? aP.localeCompare(bP) : bP.localeCompare(aP);
+            }
+            if (sIdx >= 0) {
+                let aS = (a.data[sIdx] || "").toString().toLowerCase();
+                let bS = (b.data[sIdx] || "").toString().toLowerCase();
+                if (aS !== bS) return sortAscending ? aS.localeCompare(bS) : bS.localeCompare(aS);
+            }
+            return aVal.localeCompare(bVal);
+        }
+    });
+
+    let container = document.getElementById('contentList');
+    container.innerHTML = "";
+
+    if (filtered.length === 0) {
+        container.innerHTML = `<div class="text-center text-muted my-4">No records found matching filters.</div>`;
+        return;
+    }
+
+    // VIEW 4: AT-A-GLANCE MATRIX ANALYTICS
+    if (mode === 4) {
+        let localitiesSet = new Set();
+        filtered.forEach(r => {
+            let h = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            if (h) localitiesSet.add(h);
+        });
+        let localities = Array.from(localitiesSet).sort();
+        if (localities.length === 0) localities = ["All Data"];
+
+        let t1Counts = {};
+        let t1ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
+        let t1GrandTotal = 0;
+
+        localities.forEach(loc => {
+            t1Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
+        });
+
+        filtered.forEach(r => {
+            let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            if (!t1Counts[loc]) {
+                t1Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
+            }
+
+            let arr = r._arrive;
+            let dep = r._depart;
+            let slot = "other";
+
+            if (arr === "Friday" && dep === "Sunday (Lord's Day)") slot = "fri_sun";
+            else if (arr === "Saturday" && dep === "Sunday (Lord's Day)") slot = "sat_sun";
+            else if (arr === "Friday" && dep === "Saturday") slot = "fri_sat";
+            else if (arr === "Saturday" && (dep === "Saturday" || dep === "Saturday (Day Only)")) slot = "sat_sat";
+
+            t1Counts[loc][slot]++;
+            t1Counts[loc].rowTotal++;
+            t1ColTotals[slot]++;
+            t1GrandTotal++;
+        });
+
+        let html = `
+            <div class="matrix-title">📋 1. Attendee Counts (Locality × Timing)</div>
+            <div class="matrix-table-container">
+                <table class="table table-bordered table-sm table-matrix table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Locality (Abbr)</th>
+                            <th>Fri ➔ Sun<br><small class="text-muted">Full-Time</small></th>
+                            <th>Sat ➔ Sun<br><small class="text-muted">Sat Night</small></th>
+                            <th>Fri ➔ Sat<br><small class="text-muted">Fri Night</small></th>
+                            <th>Sat ➔ Sat<br><small class="text-muted">Day-Only</small></th>
+                            <th>Other</th>
+                            <th class="table-secondary">Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
+
+        localities.forEach(loc => {
+            let abbr = abbreviateLocality(loc);
+            let row = t1Counts[loc];
+            html += `
+                <tr>
+                    <td title="${loc}"><span class="badge bg-light text-dark border me-1">${abbr}</span> <small class="text-muted">${loc}</small></td>
+                    <td>${row.fri_sun || '-'}</td>
+                    <td>${row.sat_sun || '-'}</td>
+                    <td>${row.fri_sat || '-'}</td>
+                    <td>${row.sat_sat || '-'}</td>
+                    <td>${row.other || '-'}</td>
+                    <td class="fw-bold bg-light">${row.rowTotal}</td>
+                </tr>
+            `;
+        });
+
+        html += `
+                    <tr class="table-secondary fw-bold">
+                        <td>Grand Total</td>
+                        <td>${t1ColTotals.fri_sun}</td>
+                        <td>${t1ColTotals.sat_sun}</td>
+                        <td>${t1ColTotals.fri_sat}</td>
+                        <td>${t1ColTotals.sat_sat}</td>
+                        <td>${t1ColTotals.other}</td>
+                        <td class="table-dark">${t1GrandTotal}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        `;
+
+        let t2Counts = {};
+        let t2ColTotals = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0 };
+        let t2GrandTotal = 0;
+
+        localities.forEach(loc => {
+            t2Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
+        });
+
+        filtered.forEach(r => {
+            if (!r._tstate || !r._tstate.is_ride_req) return;
+            let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            if (!t2Counts[loc]) {
+                t2Counts[loc] = { fri_sun: 0, sat_sun: 0, fri_sat: 0, sat_sat: 0, other: 0, rowTotal: 0 };
+            }
+
+            let arr = r._arrive;
+            let dep = r._depart;
+            let slot = "other";
+
+            if (arr === "Friday" && dep === "Sunday (Lord's Day)") slot = "fri_sun";
+            else if (arr === "Saturday" && dep === "Sunday (Lord's Day)") slot = "sat_sun";
+            else if (arr === "Friday" && dep === "Saturday") slot = "fri_sat";
+            else if (arr === "Saturday" && (dep === "Saturday" || dep === "Saturday (Day Only)")) slot = "sat_sat";
+
+            t2Counts[loc][slot]++;
+            t2Counts[loc].rowTotal++;
+            t2ColTotals[slot]++;
+            t2GrandTotal++;
+        });
+
+        html += `
+            <div class="matrix-title">🙋 2. Ride Requests to Camp (Locality × Timing)</div>
+            <div class="matrix-table-container">
+                <table class="table table-bordered table-sm table-matrix table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Locality (Abbr)</th>
+                            <th>Fri ➔ Sun</th>
+                            <th>Sat ➔ Sun</th>
+                            <th>Fri ➔ Sat</th>
+                            <th>Sat ➔ Sat</th>
+                            <th>Other</th>
+                            <th class="table-secondary">Total Rides</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
+
+        localities.forEach(loc => {
+            let abbr = abbreviateLocality(loc);
+            let row = t2Counts[loc];
+            html += `
+                <tr>
+                    <td title="${loc}"><span class="badge bg-light text-dark border me-1">${abbr}</span> <small class="text-muted">${loc}</small></td>
+                    <td>${row.fri_sun > 0 ? `<strong class="text-danger">${row.fri_sun}</strong>` : '-'}</td>
+                    <td>${row.sat_sun > 0 ? `<strong class="text-danger">${row.sat_sun}</strong>` : '-'}</td>
+                    <td>${row.fri_sat > 0 ? `<strong class="text-danger">${row.fri_sat}</strong>` : '-'}</td>
+                    <td>${row.sat_sat > 0 ? `<strong class="text-danger">${row.sat_sat}</strong>` : '-'}</td>
+                    <td>${row.other > 0 ? `<strong class="text-danger">${row.other}</strong>` : '-'}</td>
+                    <td class="fw-bold bg-light">${row.rowTotal > 0 ? `<span class="badge-req">${row.rowTotal}</span>` : '0'}</td>
+                </tr>
+            `;
+        });
+
+        html += `
+                    <tr class="table-secondary fw-bold">
+                        <td>Total Requested</td>
+                        <td>${t2ColTotals.fri_sun}</td>
+                        <td>${t2ColTotals.sat_sun}</td>
+                        <td>${t2ColTotals.fri_sat}</td>
+                        <td>${t2ColTotals.sat_sat}</td>
+                        <td>${t2ColTotals.other}</td>
+                        <td class="table-danger text-danger">${t2GrandTotal}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        `;
+
+        let distIdx = jsFindColIdx(headers, ["district", "region", "area", "zone"], -1);
+        let distMap = {};
+        let totalDistrictAttendees = 0;
+
+        filtered.forEach(r => {
+            let dist = distIdx >= 0 ? (r.data[distIdx] || "General / Unassigned").trim() : "All Districts";
+            let loc = colMap.hall >= 0 ? (r.data[colMap.hall] || "Unassigned").trim() : "All Data";
+            if (!dist) dist = "General / Unassigned";
+
+            if (!distMap[dist]) {
+                distMap[dist] = { total: 0, localities: {} };
+            }
+            distMap[dist].total++;
+            distMap[dist].localities[loc] = (distMap[dist].localities[loc] || 0) + 1;
+            totalDistrictAttendees++;
+        });
+
+        html += `
+            <div class="matrix-title">🏛️ 3. Counts by District & Locality</div>
+            <div class="matrix-table-container">
+                <table class="table table-bordered table-sm table-matrix table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th style="width: 35%;">District</th>
+                            <th style="width: 45%;">Locality</th>
+                            <th style="width: 20%;">Attendee Count</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+        `;
+
+        let sortedDistricts = Object.keys(distMap).sort();
+        sortedDistricts.forEach(dist => {
+            let dData = distMap[dist];
+            let locKeys = Object.keys(dData.localities).sort();
+            let firstRow = true;
+
+            locKeys.forEach(loc => {
+                html += `<tr>`;
+                if (firstRow) {
+                    html += `<td rowspan="${locKeys.length + 1}" class="fw-bold align-middle bg-light">${dist}</td>`;
+                    firstRow = false;
+                }
+                html += `
+                    <td>${loc}</td>
+                    <td>${dData.localities[loc]}</td>
+                </tr>`;
+            });
+
+            html += `
+                <tr class="table-light fw-bold" style="border-bottom: 2px solid #ced4da;">
+                    <td class="text-end text-muted">Subtotal for ${dist}:</td>
+                    <td class="text-primary">${dData.total}</td>
+                </tr>
+            `;
+        });
+
+        html += `
+                    <tr class="table-secondary fw-bold">
+                        <td colspan="2" class="text-end">Grand Total Attendees:</td>
+                        <td class="table-dark">${totalDistrictAttendees}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        `;
+
+        container.innerHTML = html;
+        return;
+    }
+
+    // VIEW 0 & 1: CLASSIC & ROSTER VIEWS
+    if (mode === 0 || mode === 1) {
+        let curG1 = null;
+        let curG2 = null;
+        let currentList = null;
+
+        let primaryCounts = {};
+        let secondaryCounts = {};
+        filtered.forEach(r => {
+            let valG1 = pIdx >= 0 ? (r.data[pIdx] || "(Empty)").trim() : "All Attendees";
+            let valG2 = sIdx >= 0 ? (r.data[sIdx] || "").trim() : "";
+            
+            primaryCounts[valG1] = (primaryCounts[valG1] || 0) + 1;
+            if (valG2) {
+                let compositeKey = valG1 + "|||" + valG2;
+                secondaryCounts[compositeKey] = (secondaryCounts[compositeKey] || 0) + 1;
+            }
+        });
+
+        filtered.forEach(r => {
+            let valG1 = pIdx >= 0 ? (r.data[pIdx] || "(Empty)").trim() : "All Attendees";
+            let valG2 = sIdx >= 0 ? (r.data[sIdx] || "").trim() : "";
+
+            if (valG1 !== curG1) {
+                curG1 = valG1;
+                curG2 = null;
+                let g1Total = primaryCounts[valG1] || 0;
+
+                let h1 = document.createElement('div');
+                h1.className = "card-header-g1 shadow-sm d-flex justify-content-between align-items-center";
+                h1.innerHTML = `
+                    <span>📍 ${primaryGroupCol}: ${valG1}</span>
+                    <span class="badge bg-secondary rounded-pill">${g1Total}</span>
+                `;
+                container.appendChild(h1);
+
+                currentList = document.createElement('div');
+                currentList.className = "list-group shadow-sm mb-3";
+                container.appendChild(currentList);
+            }
+
+            if (sIdx >= 0 && valG2 && valG2 !== curG2) {
+                curG2 = valG2;
+                let g2Total = secondaryCounts[valG1 + "|||" + valG2] || 0;
+
+                let h2 = document.createElement('div');
+                h2.className = "card-header-g2 d-flex justify-content-between align-items-center";
+                h2.innerHTML = `
+                    <span>⛺ ${secondaryGroupCol}: ${valG2}</span>
+                    <span class="badge bg-light text-dark border">${g2Total}</span>
+                `;
+                currentList.appendChild(h2);
+            }
+
+            let item = document.createElement('a');
+            item.className = "list-group-item list-group-item-action";
+            item.onclick = () => showDetail(r.data);
+
+            let name = r.data[colMap.name] || "(Unnamed)";
+            let status = colMap.status >= 0 ? (r.data[colMap.status] || "") : "";
+
+            if (mode === 1) {
+                item.className += " dense-row d-flex justify-content-between align-items-center";
+                item.innerHTML = `
+                    <span class="fw-bold fs-6 text-truncate me-2">${name}</span>
+                    <small class="text-muted text-end text-truncate">${status}</small>
+                `;
+            } else {
+                let subParts = [];
+                let tState = r._tstate;
+                if (tState.is_driver) {
+                    subParts.push("🚗 Driver");
+                    if (tState.space_val && tState.space_val.trim()) {
+                        subParts.push("💺 Seats: " + tState.space_val.trim());
+                    }
+                } else if (tState.has_valid_space && tState.explicit_driver_no) {
+                    subParts.push("💺 Offered Seats: " + tState.space_val.trim());
+                } else if (tState.space_val && tState.space_val.trim() && !tState.explicit_driver_no) {
+                    subParts.push("💺 Space: " + tState.space_val.trim());
+                }
+                
+                if (tState.is_ride_req) {
+                    subParts.push("🙋 Ride Req");
+                }
+
+                let subText = subParts.length ? "  •  " + subParts.join("  •  ") : "";
+                let statusText = status ? `[${status}]` : "";
+
+                item.innerHTML = `
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div class="pe-2 text-truncate">
+                            <div class="fw-bold text-truncate">${name}</div>
+                            <small class="text-muted text-truncate d-block">${statusText} ${subText}</small>
+                        </div>
+                        <span class="text-muted">&rsaquo;</span>
+                    </div>
+                `;
+            }
+            currentList.appendChild(item);
+        });
+
+    } else {
+        // VIEW 2 & 3: LOGISTICS (TO CAMP / TO NYC)
+        let groupMath = {};
+        filtered.forEach(r => {
+            let grp = mode === 2 ? r._arrive : r._depart;
+            if (!groupMath[grp]) groupMath[grp] = { total: 0, needs: 0, seats: 0, rows: [] };
+            groupMath[grp].total++;
+            if (r._tstate.is_ride_req) groupMath[grp].needs++;
+            if (r._tstate.is_driver) groupMath[grp].seats += r._tstate.seat_count;
+            groupMath[grp].rows.push(r);
+        });
+
+        let sortedGroups = Object.keys(groupMath).sort((a, b) => {
+            return (timeWeights[a] || 99) - (timeWeights[b] || 99);
+        });
+
+        sortedGroups.forEach(grp => {
+            let stats = groupMath[grp];
+            let deficit = stats.needs - stats.seats;
+            let prefix = mode === 2 ? "🚐 To Camp:" : "🚐 To NYC:";
+
+            let badgeHtml = "";
+            let headerClass = "card-header-g1";
+
+            if (stats.needs === 0 && stats.seats === 0) {
+                badgeHtml = `<span class="badge bg-secondary">No Requests</span>`;
+            } else if (deficit > 0) {
+                headerClass += " card-header-deficit";
+                badgeHtml = `<span class="badge bg-danger">⚠️ Short ${deficit}</span>`;
+            } else {
+                headerClass += " card-header-surplus";
+                badgeHtml = `<span class="badge bg-success">✅ Surplus ${-deficit}</span>`;
+            }
+
+            let h = document.createElement('div');
+            h.className = headerClass + " d-flex justify-content-between align-items-center";
+            h.innerHTML = `
+                <div>
+                    <div><strong>🕒 ${prefix} ${grp}</strong> <span class="badge bg-dark bg-opacity-50 ms-1">${stats.total} attendees</span></div>
+                    <small>Needs: <strong>${stats.needs}</strong> | Seats: <strong>${stats.seats}</strong></small>
+                </div>
+                <div>${badgeHtml}</div>
+            `;
+            container.appendChild(h);
+
+            let list = document.createElement('div');
+            list.className = "list-group shadow-sm mb-3";
+
+            stats.rows.forEach(r => {
+                let item = document.createElement('a');
+                item.className = "list-group-item list-group-item-action";
+                item.onclick = () => showDetail(r.data);
+
+                let badge = "";
+                if (r._tstate.is_driver) badge = `<span class="badge-driver">🚗 Driver (${r._tstate.space_val || 'Yes'})</span>`;
+                else if (r._tstate.has_valid_space && r._tstate.explicit_driver_no) badge = `<span class="badge-offer">Offer (${r._tstate.space_val})</span>`;
+                else if (r._tstate.is_ride_req) badge = `<span class="badge-req">🙋 Need Ride</span>`;
+
+                let name = r.data[colMap.name] || "(Unnamed)";
+                let status = colMap.status >= 0 ? (r.data[colMap.status] || "") : "";
+                let hall = colMap.hall >= 0 ? (r.data[colMap.hall] || "").trim() : "";
+
+                let hallTag = hall ? `<span class="badge-hall-tag me-1" title="${hall}">📍 ${hall}</span>` : "";
+                let statusTag = status ? `<small class="text-muted">${status}</small>` : "";
+
+                item.innerHTML = `
+                    <div class="d-flex justify-content-between align-items-start gap-2">
+                        <div style="min-width: 0; flex: 1;">
+                            <div class="fw-bold text-truncate mb-1" style="font-size: 0.95rem;">${name}</div>
+                            <div class="d-flex flex-wrap align-items-center gap-1">
+                                ${hallTag}
+                                ${statusTag}
+                            </div>
+                        </div>
+                        <div class="flex-shrink-0 text-end pt-1">
+                            ${badge}
+                        </div>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+            container.appendChild(list);
+        });
+    }
+}
+
+function showDetail(row) {
+    document.getElementById('modalTitle').innerText = row[colMap.name] || "Attendee Details";
+    let body = document.getElementById('modalBody');
+    body.innerHTML = "";
+    headers.forEach((h, i) => {
+        let cleanH = (h || "").trim();
+        let cleanV = (row[i] || "").trim();
+        if (cleanH && cleanV) {
+            body.innerHTML += `
+                <div class="mb-2 pb-1 border-bottom">
+                    <small class="text-muted d-block fw-semibold">${cleanH}</small>
+                    <span class="fs-6">${cleanV}</span>
+                </div>
+            `;
+        }
+    });
+    new bootstrap.Modal(document.getElementById('detailModal')).show();
+}
+
+// Initial data load
+refreshData();
+</script>
+</body>
+</html>
+"""
 
 
 @app.route("/")
 def index():
-resp = make_response(render_template_string(HTML_TEMPLATE))
-resp.headers["Cache-Control"] = "public, max-age=300"
-return resp
+    resp = make_response(render_template_string(HTML_TEMPLATE))
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
 
 @app.route("/api/data")
 def get_data():
-force_refresh = request.args.get("refresh") in ["1", "true", "yes"]
-data, was_fresh = get_cached_or_fresh_data(force_refresh=force_refresh)
+    force_refresh = request.args.get("refresh") in ["1", "true", "yes"]
+    data, was_fresh = get_cached_or_fresh_data(force_refresh=force_refresh)
 
-resp = make_response(jsonify(data))
-resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=60"
-return resp
+    resp = make_response(jsonify(data))
+    resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=60"
+    return resp
 
 
-if name == "main":
-port = int(os.environ.get("PORT", 5000))
-app.run(host="0.0.0.0", port=port, debug=False)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
